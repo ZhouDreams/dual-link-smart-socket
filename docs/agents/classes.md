@@ -1199,3 +1199,493 @@ wifi_link         (依赖: network_link, network_types.h, esp_wifi, esp_netif, e
 ```
 
 `metering_service` 通过 esp_event 消费 `BL0942_EVENT_MEASUREMENT`，不直接依赖 `bl0942_t` 句柄。`wifi_link` 实现 `network_link_ops_t`，通过 `network_link_create()` 工厂返回 `network_link_t *` 注入 `network_manager`。
+
+---
+
+## 9. Network Manager（双模网络管理器）
+
+Network Manager 是网络抽象层的管理模块，持有主/备两条 `network_link_t *` 链路，负责链路选择、故障切换、回切和订阅意图管理。对上层提供统一的网络入口。
+
+### 9.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `network_manager_t` | 用户 API (opaque) | app_controller + thingsboard_client | 句柄 | struct 定义在 .c |
+| `network_manager_config_t` | 用户 API | app_controller | 配置结构体 | 主/备链路指针 + 切换策略参数 |
+| `network_manager_status_t` | 用户 API | app_controller + thingsboard_client | 值对象 | 聚合状态快照 |
+
+### 9.2 `network_manager_config_t` — 初始化配置
+
+**所属层**：网络抽象层
+**可见性**：用户 API — app_controller 创建时传入
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    network_link_t *primary;              // 主链路（Wi-Fi）
+    network_link_t *backup;               // 备链路（LTE，可为 NULL）
+    network_link_type_t preferred_primary; // 首选主链路类型
+    uint32_t failover_recheck_ms;         // 备链路状态重检周期
+    uint32_t failback_delay_ms;           // 主链路恢复后回切延迟
+    int max_subscriptions;                // 订阅意图表容量
+} network_manager_config_t;
+```
+
+### 9.3 `network_manager_status_t` — 聚合状态
+
+**所属层**：网络抽象层
+**可见性**：用户 API
+**OOP 角色**：值对象
+
+```c
+typedef struct {
+    network_link_type_t active_link;         // 当前活动链路类型
+    bool ready;                              // 当前是否有可用 MQTT 通道
+    network_link_status_t primary_status;    // 主链路状态
+    network_link_status_t backup_status;     // 备链路状态
+} network_manager_status_t;
+```
+
+### 9.4 `network_manager_t` — 句柄
+
+**所属层**：网络抽象层
+**可见性**：用户 API (opaque) — thingsboard_client 通过此句柄 publish/subscribe
+**OOP 角色**：句柄
+
+**公开方法**（`network_manager.h`）：
+
+```c
+network_manager_t *network_manager_create(const network_manager_config_t *config);
+esp_err_t network_manager_destroy(network_manager_t *me);
+
+esp_err_t network_manager_start(network_manager_t *me);
+esp_err_t network_manager_stop(network_manager_t *me);
+
+esp_err_t network_manager_get_status(network_manager_t *me,
+                                      network_manager_status_t *out);
+esp_err_t network_manager_is_ready(network_manager_t *me, bool *out);
+
+esp_err_t network_manager_publish(network_manager_t *me,
+                                   const network_publish_request_t *req);
+esp_err_t network_manager_subscribe(network_manager_t *me,
+                                     const char *topic, network_mqtt_qos_t qos);
+esp_err_t network_manager_unsubscribe(network_manager_t *me, const char *topic);
+esp_err_t network_manager_register_rx_cb(network_manager_t *me,
+                                          network_rx_cb_t cb, void *ctx);
+```
+
+**内部结构**（定义在 `network_manager.c`）：
+
+```c
+typedef struct {
+    char topic[NETWORK_MANAGER_MAX_TOPIC_LEN];
+    network_mqtt_qos_t qos;
+    bool in_use;
+} network_manager_sub_entry_t;
+
+struct network_manager {
+    network_link_t *primary;
+    network_link_t *backup;
+    network_link_t *active;
+    network_link_type_t preferred_primary;
+    uint32_t failover_recheck_ms;
+    uint32_t failback_delay_ms;
+    // 订阅意图表
+    network_manager_sub_entry_t *sub_table;
+    int sub_table_size;
+    // 线程安全
+    SemaphoreHandle_t mutex;
+    // 下行回调
+    network_rx_cb_t rx_cb;
+    void *rx_ctx;
+    // 内部状态
+    uint64_t failback_since_us;
+    bool started;
+    bool destroying;
+};
+```
+
+### 9.5 链路切换逻辑
+
+```
+活动链路状态 → ERROR
+    │
+    ├─ backup 存在且状态为 READY 或 DEGRADED?
+    │   ├─ 是 → 切换 active = backup
+    │   │       → 遍历 sub_table，在新 active 上重放全部订阅
+    │   │       → 通知 rx_cb（可选：链路切换事件）
+    │   └─ 否 → 保持，周期性检查 backup 状态（failover_recheck_ms）
+    │
+    │
+活动链路 = backup 且 primary 恢复 READY
+    │  primary 持续 READY 超过 failback_delay_ms?
+    │
+    └─ 是 → 切回 active = primary → 重放订阅表
+```
+
+### 9.6 关键设计决策
+
+- 持有 `primary` 和 `backup` 两个 `network_link_t *`，通过包装函数操作，不感知子类类型
+- `start()` 启动首选主链路，`active` 指向它；若 primary 无法启动则尝试 backup
+- 订阅意图表：`subscribe`/`unsubscribe` 写入表 → 立即委托给当前 `active` 链路；活动链路切换后遍历表在新链路上全部重放
+- `rx_cb` 统一接收当前活动链路的下行消息，透传给 `thingsboard_client`
+- 回切延迟防止 Wi-Fi 抖动导致频繁来回切换
+- `backup` 可以为 NULL（单链路模式），此时不启用故障切换
+
+---
+
+## 10. Safety Guard（本地安全规则）
+
+Safety Guard 是业务服务层的纯规则安全模块。订阅 `METERING_EVENT_SNAPSHOT`，做可解释的过流/过功率判定，输出安全快照。不包含 AI 模型或负载分类。
+
+### 10.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `safety_guard_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
+| `safety_guard_config_t` | 用户 API | app_controller | 配置结构体 | 过流/过功率阈值 + 持续判定参数 |
+| `safety_guard_level_t` | 用户 API | app_controller + lvgl_dashboard | 枚举 | NORMAL / WARNING / DANGER |
+| `safety_guard_event_t` | 用户 API | app_controller | 枚举 | NONE / OVERCURRENT / OVERPOWER |
+| `safety_guard_action_t` | 用户 API | app_controller | 枚举 | NONE / RELAY_OFF |
+| `safety_guard_snapshot_t` | 用户 API | app_controller + lvgl_dashboard + thingsboard_client | 值对象 | 规则判定结果 |
+
+### 10.2 `safety_guard_config_t` — 初始化配置
+
+**所属层**：业务服务层
+**可见性**：用户 API
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    float overcurrent_threshold_a;      // 过流阈值 (A)
+    float overpower_threshold_w;        // 过功率阈值 (W)
+    int persistence_samples;            // 持续超限次数才触发动作（默认 3）
+} safety_guard_config_t;
+```
+
+### 10.3 `safety_guard_snapshot_t` — 安全快照
+
+**所属层**：业务服务层
+**可见性**：用户 API — 通过 esp_event 广播
+**OOP 角色**：值对象
+
+```c
+typedef enum {
+    SAFETY_GUARD_LEVEL_NORMAL = 0,
+    SAFETY_GUARD_LEVEL_WARNING,
+    SAFETY_GUARD_LEVEL_DANGER,
+} safety_guard_level_t;
+
+typedef enum {
+    SAFETY_GUARD_EVENT_NONE = 0,
+    SAFETY_GUARD_EVENT_OVERCURRENT,
+    SAFETY_GUARD_EVENT_OVERPOWER,
+} safety_guard_event_t;
+
+typedef enum {
+    SAFETY_GUARD_ACTION_NONE = 0,
+    SAFETY_GUARD_ACTION_RELAY_OFF,
+} safety_guard_action_t;
+
+typedef struct {
+    safety_guard_level_t level;
+    safety_guard_event_t event;
+    safety_guard_action_t suggested_action;
+    uint64_t timestamp_us;
+    bool valid;
+} safety_guard_snapshot_t;
+```
+
+### 10.4 `safety_guard_t` — 句柄
+
+**所属层**：业务服务层
+**可见性**：用户 API (opaque)
+**OOP 角色**：句柄
+
+**公开方法**（`safety_guard.h`）：
+
+```c
+safety_guard_t *safety_guard_create(const safety_guard_config_t *config);
+esp_err_t safety_guard_destroy(safety_guard_t *me);
+
+esp_err_t safety_guard_start(safety_guard_t *me);
+esp_err_t safety_guard_stop(safety_guard_t *me);
+
+esp_err_t safety_guard_get_latest(safety_guard_t *me,
+                                   safety_guard_snapshot_t *out);
+esp_err_t safety_guard_set_thresholds(safety_guard_t *me,
+                                       float overcurrent_a, float overpower_w);
+```
+
+**事件声明**：
+
+```c
+ESP_EVENT_DECLARE_BASE(SAFETY_GUARD_EVENT_BASE);
+
+typedef enum {
+    SAFETY_GUARD_EVENT_SNAPSHOT = 0,
+} safety_guard_event_id_t;
+```
+
+**内部结构**（定义在 `safety_guard.c`）：
+
+```c
+struct safety_guard {
+    safety_guard_config_t config;
+    SemaphoreHandle_t mutex;
+    safety_guard_snapshot_t latest;
+    bool has_latest;
+    int overcurrent_persistence;
+    int overpower_persistence;
+    bool initialized;
+};
+```
+
+### 10.5 判定逻辑
+
+```
+收到 METERING_EVENT_SNAPSHOT（每 1s）
+    │
+    ├─ current > overcurrent_threshold_a? → overcurrent_persistence++
+    │    └─ count >= persistence_samples? → DANGER + OVERCURRENT + RELAY_OFF
+    │    └─ 否则 → WARNING + OVERCURRENT + NONE
+    │
+    ├─ power > overpower_threshold_w? → overpower_persistence++
+    │    └─ count >= persistence_samples? → DANGER + OVERPOWER + RELAY_OFF
+    │    └─ 否则 → WARNING + OVERPOWER + NONE
+    │
+    └─ 正常 → 清零计数 → NORMAL + NONE + NONE
+```
+
+### 10.6 关键设计决策
+
+- 订阅 `METERING_EVENT_SNAPSHOT`，在每个 1s 快照上做规则判定
+- `persistence_samples` 防止瞬态尖峰误触发（默认 3，即持续 3s 才执行断开动作）
+- `suggested_action=RELAY_OFF` 时不直接操作 relay — 由 `app_controller` 协调执行
+- `set_thresholds()` 支持运行时更新（场景：ThingsBoard RPC 下发新阈值）
+- 阈值使用 SI 单位（A、W），与 `metering_snapshot_t` 保持一致
+
+---
+
+## 11. TFT Panel（LCD 硬件面板驱动）
+
+TFT Panel 是驱动适配层的 LCD 硬件封装模块，负责 SPI 初始化、像素位图传输和背光控制。对上层只暴露 `draw_bitmap` 和 `set_backlight`，隐藏 SPI 和面板型号细节。
+
+### 11.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `tft_panel_t` | 用户 API (opaque) | app_controller + lvgl_dashboard | 句柄 | struct 定义在 .c |
+| `tft_panel_config_t` | 用户 API | app_controller | 配置结构体 | SPI 引脚 + 面板尺寸 + 背光 GPIO |
+
+### 11.2 `tft_panel_config_t` — 初始化配置
+
+**所属层**：驱动适配层
+**可见性**：用户 API — app_controller 从 board_pinmap 读取后填入
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    gpio_num_t sclk_gpio;
+    gpio_num_t mosi_gpio;
+    gpio_num_t dc_gpio;
+    gpio_num_t cs_gpio;
+    gpio_num_t rst_gpio;
+    gpio_num_t bl_gpio;
+    int panel_width;
+    int panel_height;
+} tft_panel_config_t;
+```
+
+### 11.3 `tft_panel_t` — 句柄
+
+**所属层**：驱动适配层
+**可见性**：用户 API (opaque)
+**OOP 角色**：句柄
+
+**公开方法**（`tft_panel.h`）：
+
+```c
+tft_panel_t *tft_panel_create(const tft_panel_config_t *config);
+esp_err_t tft_panel_destroy(tft_panel_t *me);
+
+esp_err_t tft_panel_draw_bitmap(tft_panel_t *me, int x1, int y1, int x2, int y2,
+                                 const void *color_data);
+esp_err_t tft_panel_set_backlight(tft_panel_t *me, bool enabled);
+int tft_panel_get_width(const tft_panel_t *me);
+int tft_panel_get_height(const tft_panel_t *me);
+```
+
+**内部结构**（定义在 `tft_panel.c`）：
+
+```c
+struct tft_panel {
+    tft_panel_config_t config;
+    spi_device_handle_t spi;
+    bool backlight_on;
+    bool initialized;
+};
+```
+
+### 11.4 关键设计决策
+
+- 封装 SPI host 初始化和 LCD 初始化序列（ST7789 等），对上层只暴露 `draw_bitmap` 和背光控制
+- LVGL 的 `flush_cb` 由 `lvgl_dashboard` 注册，内部调用 `tft_panel_draw_bitmap`
+- `tft_panel_config_t` 从 `board_pinmap` 读取 SPI 引脚后注入，不内部依赖 pinmap
+- `panel_width`/`panel_height` 由调用方配置（ESP32-S3-LCD-1.47B 为 172×320）
+
+---
+
+## 12. LVGL Dashboard（LVGL 本地看板）
+
+LVGL Dashboard 是驱动适配层的 UI 模块，管理 LVGL 控件树、业务状态缓存和屏幕开关。直接订阅业务 esp_event（`METERING_EVENT_SNAPSHOT`、`RELAY_EVENT_STATE_CHANGED`、`SAFETY_GUARD_EVENT_SNAPSHOT`），在 LVGL task 内更新控件。
+
+### 12.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `lvgl_dashboard_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
+| `lvgl_dashboard_config_t` | 用户 API | app_controller | 配置结构体 | tft_panel 句柄 + LVGL 任务参数 |
+| `dashboard_state_t` | 用户 API | lvgl_dashboard 内部缓存 | 值对象 | 聚合的看板业务状态 |
+| `dashboard_network_t` | 用户 API | lvgl_dashboard | 枚举 | OFFLINE / CONNECTING / WIFI / LTE |
+
+### 12.2 `dashboard_state_t` — 看板状态
+
+**所属层**：驱动适配层
+**可见性**：用户 API — lvgl_dashboard 内部缓存，LVGL task 读取
+**OOP 角色**：值对象
+
+```c
+typedef enum {
+    DASHBOARD_NET_OFFLINE = 0,
+    DASHBOARD_NET_CONNECTING,
+    DASHBOARD_NET_WIFI,
+    DASHBOARD_NET_LTE,
+} dashboard_network_t;
+
+typedef struct {
+    // 电参量
+    float voltage;
+    float current;
+    float power;
+    float total_energy;
+    bool metering_valid;
+    // 继电器
+    bool relay_on;
+    bool relay_known;
+    // 网络
+    dashboard_network_t network;
+    bool network_ready;
+    // 安全
+    safety_guard_level_t safety_level;
+    bool safety_valid;
+    // 屏幕
+    bool screen_enabled;
+    uint64_t last_update_us;
+} dashboard_state_t;
+```
+
+### 12.3 `lvgl_dashboard_config_t` — 初始化配置
+
+**所属层**：驱动适配层
+**可见性**：用户 API
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    tft_panel_t *panel;                // TFT 面板句柄
+    int lvgl_task_stack;               // LVGL task 栈大小
+    int lvgl_task_priority;            // LVGL task 优先级
+    uint32_t lvgl_tick_period_ms;      // LVGL tick 周期
+    uint32_t update_period_ms;         // 控件更新周期
+} lvgl_dashboard_config_t;
+```
+
+### 12.4 `lvgl_dashboard_t` — 句柄
+
+**所属层**：驱动适配层
+**可见性**：用户 API (opaque)
+**OOP 角色**：句柄
+
+**公开方法**（`lvgl_dashboard.h`）：
+
+```c
+lvgl_dashboard_t *lvgl_dashboard_create(const lvgl_dashboard_config_t *config);
+esp_err_t lvgl_dashboard_destroy(lvgl_dashboard_t *me);
+
+esp_err_t lvgl_dashboard_start(lvgl_dashboard_t *me);
+esp_err_t lvgl_dashboard_stop(lvgl_dashboard_t *me);
+
+esp_err_t lvgl_dashboard_set_screen_enabled(lvgl_dashboard_t *me, bool enabled);
+```
+
+**内部结构**（定义在 `lvgl_dashboard.c`）：
+
+```c
+struct lvgl_dashboard {
+    lvgl_dashboard_config_t config;
+    SemaphoreHandle_t mutex;
+    dashboard_state_t state_cache;
+    // LVGL
+    lv_disp_t *display;
+    TaskHandle_t lvgl_task;
+    SemaphoreHandle_t lvgl_task_done_sema;
+    // 控件引用
+    lv_obj_t *label_voltage;
+    lv_obj_t *label_current;
+    lv_obj_t *label_power;
+    lv_obj_t *label_energy;
+    lv_obj_t *label_relay;
+    lv_obj_t *label_network;
+    lv_obj_t *label_safety;
+    // 状态
+    bool screen_enabled;
+    bool started;
+    bool initialized;
+};
+```
+
+### 12.5 数据流
+
+```
+METERING_EVENT_SNAPSHOT ──→ event_handler ──→ 更新 state_cache (mutex)
+RELAY_EVENT_STATE_CHANGED ─→ event_handler ──→ 更新 state_cache (mutex)
+SAFETY_GUARD_EVENT_SNAPSHOT → event_handler ──→ 更新 state_cache (mutex)
+                                                     │
+                              LVGL task loop ────────┘
+                              │ 每 update_period_ms:
+                              │   mutex 读 state_cache
+                              │   更新 label_voltage/current/power/...
+                              │   lv_task_handler()
+```
+
+事件回调中只做 `mutex lock → 更新 state_cache → mutex unlock`，不操作 widget。widget 更新只在 LVGL task 内完成。
+
+### 12.6 关键设计决策
+
+- 直接订阅业务事件的 esp_event，不需要 `display_service` 中间层
+- 网络状态通过 `network_manager_get_status()` 在 LVGL task loop 中轮询
+- `set_screen_enabled(false)` → 背光关闭。`set_screen_enabled(true)` → 背光打开
+- `lvgl_dashboard_create()` 内部初始化 LVGL 库、创建显示对象、构建控件树
+- `lvgl_dashboard_destroy()` 清理控件树、释放 LVGL 资源、停止 LVGL task
+
+---
+
+## 模块依赖关系（Batch 1–5）
+
+```text
+board_pinmap       (无依赖)
+network_types.h    (无依赖，纯头文件)
+relay              (依赖: driver/gpio.h, FreeRTOS, esp_event)
+button             (依赖: espressif/button, driver/gpio.h)
+bl0942             (依赖: driver/uart.h, driver/gpio.h, FreeRTOS, esp_event)
+network_link       (依赖: network_types.h, esp_err.h)
+metering_service   (依赖: bl0942 事件类型, esp_event, FreeRTOS)
+wifi_link          (依赖: network_link, network_types.h, esp_wifi, esp_netif, esp_mqtt, FreeRTOS)
+network_manager    (依赖: network_link, network_types.h, FreeRTOS)
+safety_guard       (依赖: metering_service 事件类型, esp_event, FreeRTOS)
+tft_panel          (依赖: driver/spi_master.h, driver/gpio.h)
+lvgl_dashboard     (依赖: tft_panel, lvgl, esp_event, FreeRTOS)
+```
+
+各模块通过 esp_event 松耦合：`bl0942 → metering_service → safety_guard` / `lvgl_dashboard` 均通过事件串联，不直接持有对方句柄。
