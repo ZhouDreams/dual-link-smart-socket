@@ -1,2 +1,17 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "main.c"
+        "platform/board_pinmap.c"
+        "network/network_link.c"
+        "relay/relay.c"
+        "button/button_iot_adapter.c"
+        "button/button.c"
+        "bl0942/bl0942.c"
+    INCLUDE_DIRS
+        "."
+        "platform"
+        "network"
+        "relay"
+        "button"
+        "bl0942"
+)

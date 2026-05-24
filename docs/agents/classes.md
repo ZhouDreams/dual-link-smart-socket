@@ -875,3 +875,327 @@ network_link      (依赖: network_types.h, esp_err.h)
 `bl0942` 和 `relay`/`button` 一样不直接依赖 `board_pinmap` — GPIO 和 UART 参数由 `app_controller` 从 pinmap 读取后填入 `bl0942_config_t`。
 
 `network_link` 是唯一进入 C OOP 继承体系的模块。`wifi_link` 和 `lte_link`（后续批次）实现 `network_link_ops_t`，`network_manager` 只依赖 `network_link_t *` 基类指针。
+
+---
+
+## 7. Metering Service（电参量业务聚合模块）
+
+Metering Service 是业务服务层的电参量聚合模块，消费 `BL0942_EVENT_MEASUREMENT` 原始测量事件，换算为工程量，维护短窗口（1 秒）聚合，并通过 esp_event 输出周期性快照。
+
+### 7.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `metering_service_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
+| `metering_config_t` | 用户 API | app_controller | 配置结构体 | 转换系数 + 窗口参数 |
+| `metering_snapshot_t` | 用户 API | safety_guard + thingsboard_client + display_service | 值对象 | 窗口聚合后的工程量快照 |
+
+### 7.2 `metering_config_t` — 初始化配置
+
+**所属层**：业务服务层
+**可见性**：用户 API — app_controller 在创建时传入
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    float v_rms_coeff;             // 电压转换系数 (V = raw * coeff)
+    float i_rms_coeff;             // 电流转换系数 (A = raw * coeff)
+    float watt_coeff;              // 功率转换系数 (W = raw * coeff)
+    float cf_coeff;                // 电能转换系数 (Wh = raw * coeff)
+    int window_samples;            // 窗口样本数（默认 10）
+    int publish_period_ms;         // 快照发布周期（默认 1000ms）
+} metering_config_t;
+```
+
+### 7.3 `metering_snapshot_t` — 电参量快照
+
+**所属层**：业务服务层
+**可见性**：用户 API — 通过 esp_event 广播，或 `get_latest()` 主动获取
+**OOP 角色**：值对象
+
+```c
+typedef struct {
+    float voltage;                 // 电压 (V)
+    float current;                 // 电流 (A)
+    float power;                   // 有功功率 (W)
+    float total_energy;            // 累计电能 (Wh)
+    float frequency;               // 电网频率 (Hz)
+    uint64_t timestamp_us;         // 快照时间戳
+    bool valid;                    // 快照是否有效
+} metering_snapshot_t;
+```
+
+### 7.4 `metering_service_t` — 句柄
+
+**所属层**：业务服务层
+**可见性**：用户 API (opaque) — app_controller 创建，consumers 通过事件订阅消费数据；struct 定义在 `.c` 中
+**OOP 角色**：句柄
+
+**公开方法**（`metering_service.h`）：
+
+```c
+metering_service_t *metering_service_create(const metering_config_t *config);
+esp_err_t metering_service_destroy(metering_service_t *me);
+
+esp_err_t metering_service_start(metering_service_t *me);
+esp_err_t metering_service_stop(metering_service_t *me);
+
+esp_err_t metering_service_get_latest(metering_service_t *me,
+                                       metering_snapshot_t *out);
+esp_err_t metering_service_reset_energy(metering_service_t *me);
+```
+
+**事件声明**：
+
+```c
+ESP_EVENT_DECLARE_BASE(METERING_EVENT_BASE);
+
+typedef enum {
+    METERING_EVENT_SNAPSHOT = 0,     // 窗口聚合完成（载荷: metering_snapshot_t）
+} metering_event_id_t;
+```
+
+**内部结构**（定义在 `metering_service.c`）：
+
+```c
+struct metering_service {
+    metering_config_t config;
+    SemaphoreHandle_t mutex;
+    metering_snapshot_t latest;
+    bool has_latest;
+    // 窗口聚合
+    float window_v_sum;
+    float window_i_sum;
+    float window_p_sum;
+    float window_freq_sum;
+    int window_count;
+    uint64_t window_start_us;
+    // 累计电能
+    float total_energy;
+    bool initialized;
+};
+```
+
+**调用方使用模式**：
+
+```c
+/* app_controller 创建并启动 */
+metering_config_t cfg = {
+    .v_rms_coeff       = 0.00012207f,   // 来自 BL0942 datasheet
+    .i_rms_coeff       = 0.00006104f,
+    .watt_coeff        = 0.00000745f,
+    .cf_coeff          = 0.00000001f,
+    .window_samples    = 10,
+    .publish_period_ms = 1000,
+};
+metering_service_t *ms = metering_service_create(&cfg);
+metering_service_start(ms);  // 开始订阅 BL0942 事件并聚合
+
+/* safety_guard（后续批次）订阅 */
+esp_event_handler_register(METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+                           safety_guard_on_snapshot, NULL);
+
+/* 主动查询最新快照 */
+metering_snapshot_t snap;
+metering_service_get_latest(ms, &snap);
+printf("Power: %.2f W, Energy: %.2f Wh\n", snap.power, snap.total_energy);
+```
+
+### 7.5 线程模型
+
+```
+bl0942 sample task
+    │  BL0942_EVENT_MEASUREMENT（esp_event 广播）
+    ▼
+metering_service（在 esp_event handler 上下文）
+    │  换算 raw → 工程量
+    │  累加入当前窗口
+    │  窗口满 → 计算均值
+    │         → 发布 METERING_EVENT_SNAPSHOT
+    ▼
+safety_guard / thingsboard_client / display_service
+```
+
+### 7.6 关键设计决策
+
+- `start()` 注册 `BL0942_EVENT_MEASUREMENT` 事件处理器，在 handler 中换算并聚合
+- 窗口大小由 `window_samples` 和 bl0942 的 `sample_period_ms` 共同决定（默认 10 × 100ms = 1s）
+- 窗口内做简单算术平均（`sum / count`），不做滑动窗口或加权，降低内存和计算开销
+- `total_energy` 由 CF 脉冲累加计算，`reset_energy()` 归零（用于电量清零或切换计费周期）
+- bl0942 故障时发布 `valid=false` 的快照，不停止服务
+- 换算系数默认值基于 BL0942 数据手册的参考电路参数，可由调用方覆盖
+- `get_latest()` 返回最近一次有效快照的拷贝，线程安全
+
+---
+
+## 8. Wi-Fi Link（Wi-Fi 链路子类）
+
+Wi-Fi Link 是网络抽象层的 `network_link_t` 具体子类，实现 Wi-Fi STA + MQTT 的完整链路。内部直接使用 `esp_netif` + `esp_wifi` + `esp_mqtt`，通过 `network_link_ops_t` 虚函数表接入 `network_manager` 的多态体系。
+
+### 8.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `wifi_link_config_t` | 用户 API | app_controller | 配置结构体 | Wi-Fi + MQTT 连接参数 |
+| `wifi_link_t` | 内部 | wifi_link 自身 | 子类结构体 | 继承 `network_link_t`，内含 Wi-Fi/MQTT 句柄 |
+
+`network_link_ops_t` 和 `network_link_t` 已在 Batch 3 第 6 节定义。
+
+### 8.2 `wifi_link_config_t` — 初始化配置
+
+**所属层**：网络抽象层
+**可见性**：用户 API — app_controller 在创建时传入
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    const char *ssid;
+    const char *password;
+    const char *mqtt_broker_host;
+    uint16_t mqtt_broker_port;
+    const char *mqtt_client_id;
+    const char *mqtt_username;
+    const char *mqtt_password;
+    uint16_t mqtt_keepalive_s;
+    bool mqtt_clean_session;
+    bool mqtt_use_tls;
+    int max_subscriptions;
+    int max_topic_len;
+} wifi_link_config_t;
+```
+
+### 8.3 `wifi_link_t` — 子类内部结构
+
+**所属层**：网络抽象层
+**可见性**：内部 — 定义在 `wifi_link.c`，不暴露给调用方
+**OOP 角色**：具体子类 — `network_link_t` 必须在第一个字段
+
+```c
+typedef struct {
+    char topic[WIFI_LINK_MAX_TOPIC_LEN];
+    network_mqtt_qos_t qos;
+    bool in_use;
+} wifi_link_sub_entry_t;
+
+struct wifi_link {
+    network_link_t base;                       // 必须是第一个字段
+    wifi_link_config_t config;
+    // Wi-Fi
+    esp_netif_t *netif;
+    bool wifi_connected;
+    // MQTT
+    esp_mqtt_client_handle_t mqtt_client;
+    bool mqtt_connected;
+    // 订阅表
+    wifi_link_sub_entry_t *sub_table;
+    int sub_table_size;
+    // 线程安全
+    SemaphoreHandle_t mutex;
+    // 下行回调
+    network_rx_cb_t rx_cb;
+    void *rx_ctx;
+    // 状态
+    bool started;
+    bool destroying;
+};
+```
+
+### 8.4 工厂函数和 ops 表
+
+**工厂函数**（`wifi_link.h`）：
+
+```c
+network_link_t *wifi_link_create(const wifi_link_config_t *config);
+```
+
+**ops 实现映射**（在 `wifi_link.c` 中为 `static const network_link_ops_t`）：
+
+| ops 方法 | 实现函数 | 要点 |
+|----------|----------|------|
+| `destroy` | `wifi_link_destroy_impl` | 停止链路 + 释放 netif / mqtt_client / sub_table / 自身 |
+| `start` | `wifi_link_start_impl` | 初始化 TCP/IP + netif → 注册 Wi-Fi 事件 → 启动 STA |
+| `stop` | `wifi_link_stop_impl` | 断开 MQTT → 断开 Wi-Fi → 保留资源可重 start |
+| `get_status` | `wifi_link_get_status_impl` | 返回 `{WIFI, state, link_up, mqtt_ready}` |
+| `publish` | `wifi_link_publish_impl` | `esp_mqtt_client_enqueue()` |
+| `subscribe` | `wifi_link_subscribe_impl` | 写入订阅表 + `esp_mqtt_client_subscribe()` |
+| `unsubscribe` | `wifi_link_unsubscribe_impl` | 移除订阅表 + `esp_mqtt_client_unsubscribe()` |
+| `register_rx_cb` | `wifi_link_register_rx_cb_impl` | 保存回调 + 上下文，同一时刻只保留一个 |
+
+### 8.5 状态机和链路推进
+
+```text
+IDLE → STARTING → CONNECTING → MQTT_CONNECTING → READY
+                       │                │
+  ┌──── ERROR ←────────┘                │
+  │      │                              │
+  └──────┘ (重连 → CONNECTING)           │
+                                        │
+READY → DEGRADED  (MQTT 断开但 Wi-Fi 仍连接)
+DEGRADED → READY  (MQTT 重连成功)
+```
+
+Wi-Fi STA 连接成功后自动推进到 MQTT 建链。MQTT 建链成功后遍历 `sub_table` 重放所有有效订阅。
+
+### 8.6 MQTT 下行消息流
+
+```
+esp_mqtt MQTT_EVENT_DATA
+    │
+    ▼
+wifi_link mqtt event handler（在 esp_mqtt 内部任务上下文）
+    │  构造 network_rx_data_t
+    │  调用 rx_cb(rx_data, rx_ctx)（持有 mutex 读取）
+    ▼
+network_manager（或直接 thingsboard_client）
+```
+
+### 8.7 调用方使用模式
+
+```c
+/* app_controller 装配 */
+wifi_link_config_t wifi_cfg = {
+    .ssid                = "MyWiFi",
+    .password            = "password",
+    .mqtt_broker_host    = "mqtt.thingsboard.cloud",
+    .mqtt_broker_port    = 1883,
+    .mqtt_client_id      = "smart_socket_001",
+    .mqtt_keepalive_s    = 60,
+    .mqtt_clean_session  = true,
+    .mqtt_use_tls        = false,
+    .max_subscriptions   = 8,
+    .max_topic_len       = 128,
+};
+network_link_t *wifi = wifi_link_create(&wifi_cfg);
+
+/* network_manager 通过包装函数操作 */
+network_link_start(wifi);
+network_link_publish(wifi, &req);
+network_link_subscribe(wifi, "v1/devices/me/rpc/request/+", NETWORK_MQTT_QOS0);
+```
+
+### 8.8 关键设计决策
+
+- `wifi_link_create()` 返回 `network_link_t *`，调用方不感知 `wifi_link_t` 内部结构
+- `wifi_link_config_t` 内嵌 MQTT 配置字段（`mqtt_broker_host` 等）而非引用 `network_mqtt_config_t`，因为 wifi_link 是具体实现不需要基类抽象
+- Wi-Fi 事件处理在 ESP-IDF event loop 上下文中执行，保持短小非阻塞；状态变更后立即尝试推进 MQTT 状态
+- `mutex` 保护 `wifi_connected`、`mqtt_connected`、`sub_table`、`rx_cb`，保证多线程安全
+- 订阅表固定容量，满时 `subscribe` 返回 `ESP_ERR_NO_MEM`
+- MQTT 断开 → DEGRADED；MQTT 重连成功 → READY 并重放订阅表。Wi-Fi 断开 → ERROR → 自动重连
+- `destroy` 不暴露为独立 API — 通过 `network_link_destroy(base)` 统一释放，`network_manager` 不关心子类类型
+
+---
+
+## 模块依赖关系（Batch 1–4）
+
+```text
+board_pinmap      (无依赖)
+network_types.h   (无依赖，纯头文件)
+relay             (依赖: driver/gpio.h, FreeRTOS, esp_event)
+button            (依赖: espressif/button, driver/gpio.h)
+bl0942            (依赖: driver/uart.h, driver/gpio.h, FreeRTOS, esp_event)
+network_link      (依赖: network_types.h, esp_err.h)
+metering_service  (依赖: bl0942 事件类型, esp_event, FreeRTOS)
+wifi_link         (依赖: network_link, network_types.h, esp_wifi, esp_netif, esp_mqtt, FreeRTOS)
+```
+
+`metering_service` 通过 esp_event 消费 `BL0942_EVENT_MEASUREMENT`，不直接依赖 `bl0942_t` 句柄。`wifi_link` 实现 `network_link_ops_t`，通过 `network_link_create()` 工厂返回 `network_link_t *` 注入 `network_manager`。
