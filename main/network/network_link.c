@@ -114,8 +114,6 @@ esp_err_t network_link_register_rx_cb(network_link_t *me,
                                       network_rx_cb_t cb, void *ctx)
 {
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
-    ESP_RETURN_ON_FALSE(cb != NULL, ESP_ERR_INVALID_ARG, TAG,
-                        "rx callback is null");
     ESP_RETURN_ON_FALSE(me->ops != NULL && me->ops->register_rx_cb != NULL,
                         ESP_ERR_NOT_SUPPORTED, TAG,
                         "register rx callback not supported");

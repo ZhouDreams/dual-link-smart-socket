@@ -771,6 +771,8 @@ esp_err_t network_link_register_rx_cb(network_link_t *me,
 network_link_type_t network_link_get_type(const network_link_t *me);
 ```
 
+**回调清除语义**：`network_link_register_rx_cb(me, NULL, NULL)` 清除当前回调并返回 `ESP_OK`。这允许借用链路的 `network_manager` 在销毁时解除桥接回调，避免链路后续复用时回调到已释放对象。
+
 **内部结构**（定义在 `network_link_priv.h`）：
 
 ```c
@@ -1506,9 +1508,14 @@ typedef struct {
 **公开方法**（`tft_panel.h`）：
 
 ```c
+typedef void (*tft_panel_flush_done_cb_t)(void *user_ctx);
+
 tft_panel_t *tft_panel_create(const tft_panel_config_t *config);
 esp_err_t tft_panel_destroy(tft_panel_t *me);
 
+esp_err_t tft_panel_register_flush_done_cb(tft_panel_t *me,
+                                           tft_panel_flush_done_cb_t cb,
+                                           void *user_ctx);
 esp_err_t tft_panel_draw_bitmap(tft_panel_t *me, int x1, int y1, int x2, int y2,
                                  const void *color_data);
 esp_err_t tft_panel_set_backlight(tft_panel_t *me, bool enabled);
@@ -1522,6 +1529,8 @@ int tft_panel_get_height(const tft_panel_t *me);
 struct tft_panel {
     tft_panel_config_t config;
     spi_device_handle_t spi;
+    tft_panel_flush_done_cb_t flush_done_cb;
+    void *flush_done_ctx;
     bool backlight_on;
     bool initialized;
 };
@@ -1593,11 +1602,12 @@ typedef struct {
 
 ```c
 typedef struct {
-    tft_panel_t *panel;                // TFT 面板句柄
-    int lvgl_task_stack;               // LVGL task 栈大小
-    int lvgl_task_priority;            // LVGL task 优先级
-    uint32_t lvgl_tick_period_ms;      // LVGL tick 周期
-    uint32_t update_period_ms;         // 控件更新周期
+    tft_panel_t *panel;
+    network_manager_t *network_manager;
+    int lvgl_task_stack;
+    int lvgl_task_priority;
+    uint32_t lvgl_tick_period_ms;
+    uint32_t update_period_ms;
 } lvgl_dashboard_config_t;
 ```
 
