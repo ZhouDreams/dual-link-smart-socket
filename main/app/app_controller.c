@@ -201,6 +201,8 @@ static esp_err_t app_controller_filter_stop_error(esp_err_t ret);
  *  STATIC VARIABLES
  **********************/
 
+static uint32_t s_telemetry_publish_count;
+
 /**********************
  *      MACROS
  **********************/
@@ -950,6 +952,7 @@ static bool app_controller_is_running(app_controller_t *me)
 static esp_err_t app_controller_publish_telemetry(
     app_controller_t *me, const metering_snapshot_t *snapshot)
 {
+    esp_err_t ret = ESP_OK;
     app_controller_telemetry_source_t source = { 0 };
     app_controller_telemetry_output_t output = { 0 };
     tb_telemetry_input_t input = { 0 };
@@ -1005,7 +1008,16 @@ static esp_err_t app_controller_publish_telemetry(
     input.safety_level = output.safety_level;
     input.valid = output.valid;
 
-    return thingsboard_client_publish_telemetry(me->cfg.tb, &input);
+    ret = thingsboard_client_publish_telemetry(me->cfg.tb, &input);
+    if (ret == ESP_OK) {
+        s_telemetry_publish_count++;
+        ESP_LOGI(TAG, "telemetry publish #%lu ok: energy=%.3f Wh link=%s",
+                 (unsigned long)s_telemetry_publish_count,
+                 (double)input.total_energy,
+                 input.active_link);
+    }
+
+    return ret;
 }
 
 static void app_controller_capture_first_error(esp_err_t ret,

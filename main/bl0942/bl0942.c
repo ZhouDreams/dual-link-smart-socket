@@ -375,6 +375,15 @@ bl0942_t *bl0942_create(const bl0942_config_t *config)
     me->destroying = false;
     me->initialized = true;
 
+    ESP_LOGI(TAG,
+             "initialized BL0942 on UART%d tx=%d rx=%d baud=%d addr=%u sample=%dms",
+             (int)me->config.uart_num,
+             (int)me->config.tx_gpio,
+             (int)me->config.rx_gpio,
+             me->config.baud_rate,
+             (unsigned int)me->config.device_address,
+             me->config.sample_period_ms);
+
     return me;
 
 err:
@@ -519,6 +528,9 @@ esp_err_t bl0942_start(bl0942_t *me)
         ret = ESP_ERR_NO_MEM;
         goto unlock;
     }
+
+    ESP_LOGI(TAG, "sample task started at %u Hz",
+             (unsigned int)(1000U / (uint32_t)me->config.sample_period_ms));
 
 unlock:
     (void)xSemaphoreGive(me->lifecycle_mutex);
@@ -808,6 +820,7 @@ static esp_err_t bl0942_stop_impl(bl0942_t *me)
     }
 
     me->sample_task = NULL;
+    ESP_LOGI(TAG, "sample task stopped");
 
 out:
     (void)xSemaphoreGive(me->lifecycle_mutex);
@@ -1003,6 +1016,7 @@ static esp_err_t bl0942_power_cycle(gpio_num_t en_gpio)
     ESP_RETURN_ON_ERROR(gpio_set_level(en_gpio, 1), TAG,
                         "drive enable gpio high failed");
     vTaskDelay(pdMS_TO_TICKS(BL0942_EN_SETTLE_DELAY_MS));
+    ESP_LOGI(TAG, "BL0942 power-cycled via GPIO%d", (int)en_gpio);
 
     return ESP_OK;
 }
@@ -1085,6 +1099,9 @@ static esp_err_t bl0942_hard_reset(bl0942_t *me)
                  esp_err_to_name(ret));
         goto out;
     }
+
+    ESP_LOGI(TAG, "hard reset complete; resumed at %d bps",
+             me->config.baud_rate);
 
 out:
     (void)xSemaphoreGive(me->mutex);

@@ -84,7 +84,7 @@ menu "Smart Socket"
 
         config SMART_SOCKET_TB_PORT
             int "ThingsBoard MQTT 端口"
-            default 1883
+            default 8883
 
         config SMART_SOCKET_TB_CLIENT_ID
             string "MQTT 客户端 ID"

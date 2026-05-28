@@ -27,6 +27,16 @@ mkdir -p "${BUILD_DIR}"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/network" \
+    -I"${ROOT_DIR}/main/network/wifi" \
+    "${ROOT_DIR}/main/network/wifi/wifi_link_internal.c" \
+    "${ROOT_DIR}/test/host/test_wifi_link_internal.c" \
+    -o "${BUILD_DIR}/test_wifi_link_internal"
+
+"${BUILD_DIR}/test_wifi_link_internal"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/app" \
     -I"${ROOT_DIR}/main/thingsboard" \
     "${ROOT_DIR}/main/thingsboard/thingsboard_client_internal.c" \

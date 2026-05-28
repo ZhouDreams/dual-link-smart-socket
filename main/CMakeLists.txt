@@ -6,6 +6,7 @@ idf_component_register(
         "platform/board_pinmap.c"
         "network/network_link.c"
         "network/network_manager.c"
+        "network/wifi/wifi_link_internal.c"
         "network/wifi/wifi_link.c"
         "network/lte/lte_link_internal.c"
         "network/lte/lte_link.c"

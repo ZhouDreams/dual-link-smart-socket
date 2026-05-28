@@ -180,6 +180,8 @@ static void metering_post_snapshot(const metering_snapshot_t *snapshot);
  *  STATIC VARIABLES
  **********************/
 
+static uint32_t s_snapshot_log_count;
+
 /**********************
  *      MACROS
  **********************/
@@ -748,6 +750,18 @@ static void metering_on_bl0942_measurement(void *arg, esp_event_base_t base,
     (void)xSemaphoreGive(me->mutex);
 
     if (emit) {
+        s_snapshot_log_count++;
+        if ((s_snapshot_log_count % 10U) == 0U) {
+            ESP_LOGI(TAG,
+                     "metering snapshot #%lu: V=%.2fV I=%.3fA P=%.2fW E=%.3fWh F=%.2fHz valid=%d",
+                     (unsigned long)s_snapshot_log_count,
+                     (double)snapshot.voltage,
+                     (double)snapshot.current,
+                     (double)snapshot.power,
+                     (double)snapshot.total_energy,
+                     (double)snapshot.frequency,
+                     snapshot.valid ? 1 : 0);
+        }
         metering_post_snapshot(&snapshot);
     }
 }

@@ -23,3 +23,11 @@ typedef enum {
     NETWORK_MQTT_QOS1 = 1,
     NETWORK_MQTT_QOS2 = 2,
 } network_mqtt_qos_t;
+
+typedef struct {
+    const char *topic;
+    const void *payload;
+    size_t payload_len;
+    network_mqtt_qos_t qos;
+    bool retain;
+} network_publish_request_t;

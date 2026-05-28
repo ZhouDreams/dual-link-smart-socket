@@ -11,6 +11,7 @@
  *********************/
 
 #include "wifi_link.h"
+#include "wifi_link_internal.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -767,7 +768,7 @@ static esp_err_t wifi_link_publish_impl(network_link_t *base,
                                         const network_publish_request_t *req)
 {
     esp_mqtt_client_handle_t client = NULL;
-    int msg_id = -1;
+    esp_err_t ret = ESP_OK;
 
     ESP_RETURN_ON_FALSE(base != NULL && req != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "invalid argument");
@@ -797,12 +798,9 @@ static esp_err_t wifi_link_publish_impl(network_link_t *base,
     client = me->mqtt_client;
     (void)xSemaphoreGive(me->mutex);
 
-    msg_id = esp_mqtt_client_enqueue(client, req->topic,
-                                     (const char *)req->payload,
-                                     (int)req->payload_len, (int)req->qos,
-                                     req->retain ? 1 : 0, false);
+    ret = wifi_link_internal_publish_mqtt(client, req);
     wifi_link_end_mqtt_op(me);
-    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+    return ret;
 }
 
 static esp_err_t wifi_link_subscribe_impl(network_link_t *base,
@@ -1605,6 +1603,7 @@ static void wifi_link_mqtt_event_handler(void *handler_args,
             return;
         }
 
+        ESP_LOGI(TAG, "mqtt session connected; replaying subscriptions");
         replay_ret = wifi_link_replay_subscriptions(me, client);
         if (replay_ret != ESP_OK) {
             if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
@@ -1613,6 +1612,8 @@ static void wifi_link_mqtt_event_handler(void *handler_args,
                 }
                 (void)xSemaphoreGive(me->mutex);
             }
+        } else {
+            ESP_LOGI(TAG, "mqtt ready");
         }
         wifi_link_end_runtime_action(me);
         return;
