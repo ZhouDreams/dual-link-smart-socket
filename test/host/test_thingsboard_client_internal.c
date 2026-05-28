@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -109,11 +110,12 @@ static void test_formatting(void)
 {
     char buf[256];
     size_t out_len = 0;
-    const tb_internal_telemetry_t telemetry = {
+    tb_internal_telemetry_t telemetry = {
         .voltage = 230.12f,
         .current = 1.234f,
         .power = 284.05f,
-        .total_energy = 12.34f,
+        .energy_delta = 12.345f,
+        .frequency = 50.02f,
         .relay_on = true,
         .active_link = "wifi",
         .safety_level = SAFETY_GUARD_LEVEL_WARNING,
@@ -123,9 +125,45 @@ static void test_formatting(void)
     assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
                                         &out_len) == ESP_OK);
     assert(out_len == strlen(buf));
-    assert(strstr(buf, "\"voltage\":230.12") != NULL);
-    assert(strstr(buf, "\"relayOn\":true") != NULL);
-    assert(strstr(buf, "\"activeLink\":\"wifi\"") != NULL);
+    assert(strcmp(buf,
+                  "{\"voltage\":230.12,\"current\":1.234,"
+                  "\"power\":284.05,\"energyDelta\":12.345,"
+                  "\"frequency\":50.02,\"relayOn\":true,"
+                  "\"activeLink\":\"wifi\",\"safetyLevel\":1,"
+                  "\"valid\":true}") == 0);
+    assert(strstr(buf, "\"totalEnergy\":") == NULL);
+
+    telemetry.active_link = "bad\"link";
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_OK);
+    assert(strstr(buf, "\"activeLink\":\"none\"") != NULL);
+
+    telemetry.active_link = NULL;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_OK);
+    assert(strstr(buf, "\"activeLink\":\"none\"") != NULL);
+
+    telemetry.active_link = "wifi";
+    telemetry.voltage = NAN;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_ERR_INVALID_ARG);
+    telemetry.voltage = 230.12f;
+    telemetry.current = INFINITY;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_ERR_INVALID_ARG);
+    telemetry.current = 1.234f;
+    telemetry.power = -INFINITY;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_ERR_INVALID_ARG);
+    telemetry.power = 284.05f;
+    telemetry.energy_delta = NAN;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_ERR_INVALID_ARG);
+    telemetry.energy_delta = 12.345f;
+    telemetry.frequency = INFINITY;
+    assert(tb_internal_format_telemetry(buf, sizeof(buf), &telemetry,
+                                        &out_len) == ESP_ERR_INVALID_ARG);
+    telemetry.frequency = 50.02f;
 
     assert(tb_internal_format_relay_attribute(buf, sizeof(buf), false,
                                               &out_len) == ESP_OK);
@@ -134,6 +172,10 @@ static void test_formatting(void)
     assert(tb_internal_format_power_limit_attribute(buf, sizeof(buf), 1500.0f,
                                                    &out_len) == ESP_OK);
     assert(strcmp(buf, "{\"powerLimit\":1500.00}") == 0);
+    assert(tb_internal_format_power_limit_attribute(buf, sizeof(buf), NAN,
+                                                   &out_len) == ESP_ERR_INVALID_ARG);
+    assert(tb_internal_format_power_limit_attribute(buf, sizeof(buf), INFINITY,
+                                                   &out_len) == ESP_ERR_INVALID_ARG);
 
     assert(tb_internal_format_rpc_response_topic(buf, sizeof(buf), 22,
                                                  &out_len) == ESP_OK);

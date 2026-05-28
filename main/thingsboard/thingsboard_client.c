@@ -348,7 +348,8 @@ esp_err_t thingsboard_client_publish_telemetry(thingsboard_client_t *me,
     internal_input.voltage = input->voltage;
     internal_input.current = input->current;
     internal_input.power = input->power;
-    internal_input.total_energy = input->total_energy;
+    internal_input.energy_delta = input->energy_delta;
+    internal_input.frequency = input->frequency;
     internal_input.relay_on = input->relay_on;
     internal_input.active_link = input->active_link;
     internal_input.safety_level = input->safety_level;

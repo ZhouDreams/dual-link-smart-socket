@@ -130,6 +130,18 @@ static esp_err_t parse_positive_float_param(const char *payload,
                                             float *out_value);
 
 /**
+ * @brief 获取安全的链路名称
+ * @details Get a safe active link name for JSON serialization
+ */
+static const char *safe_active_link_name(const char *active_link);
+
+/**
+ * @brief 校验遥测数值是否有限
+ * @details Validate telemetry numeric fields are finite
+ */
+static bool telemetry_values_are_finite(const tb_internal_telemetry_t *input);
+
+/**
  * @brief 保存 snprintf 结果
  * @details Store snprintf result
  * @param[in] written snprintf 返回值； snprintf result
@@ -246,15 +258,20 @@ esp_err_t tb_internal_format_telemetry(char *buf, size_t buf_size,
     if ((buf == NULL) || (buf_size == 0U) || (input == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!telemetry_values_are_finite(input)) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    active_link = (input->active_link != NULL) ? input->active_link : "none";
+    active_link = safe_active_link_name(input->active_link);
     written = snprintf(buf, buf_size,
                        "{\"voltage\":%.2f,\"current\":%.3f,"
-                       "\"power\":%.2f,\"totalEnergy\":%.2f,"
-                       "\"relayOn\":%s,\"activeLink\":\"%s\","
-                       "\"safetyLevel\":%d,\"valid\":%s}",
+                       "\"power\":%.2f,\"energyDelta\":%.3f,"
+                       "\"frequency\":%.2f,\"relayOn\":%s,"
+                       "\"activeLink\":\"%s\",\"safetyLevel\":%d,"
+                       "\"valid\":%s}",
                        input->voltage, input->current, input->power,
-                       input->total_energy, input->relay_on ? "true" : "false",
+                       input->energy_delta, input->frequency,
+                       input->relay_on ? "true" : "false",
                        active_link, (int)input->safety_level,
                        input->valid ? "true" : "false");
 
@@ -283,6 +300,9 @@ esp_err_t tb_internal_format_power_limit_attribute(char *buf, size_t buf_size,
     int written;
 
     if ((buf == NULL) || (buf_size == 0U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!isfinite(power_limit_w)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -345,6 +365,27 @@ static const char *find_in_payload(const char *payload, size_t payload_len,
     }
 
     return NULL;
+}
+
+static const char *safe_active_link_name(const char *active_link)
+{
+    if (active_link == NULL) {
+        return "none";
+    }
+    if ((strcmp(active_link, "wifi") == 0) ||
+        (strcmp(active_link, "lte") == 0) ||
+        (strcmp(active_link, "none") == 0)) {
+        return active_link;
+    }
+
+    return "none";
+}
+
+static bool telemetry_values_are_finite(const tb_internal_telemetry_t *input)
+{
+    return isfinite(input->voltage) && isfinite(input->current) &&
+           isfinite(input->power) && isfinite(input->energy_delta) &&
+           isfinite(input->frequency);
 }
 
 static const char *find_json_field_value(const char *payload,

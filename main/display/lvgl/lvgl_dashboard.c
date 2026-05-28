@@ -59,7 +59,7 @@
 #define LVGL_DASHBOARD_PLACEHOLDER_POWER      "--.-- W"
 #define LVGL_DASHBOARD_PLACEHOLDER_VOLTAGE    "--.- V"
 #define LVGL_DASHBOARD_PLACEHOLDER_CURRENT    "--.--- A"
-#define LVGL_DASHBOARD_PLACEHOLDER_ENERGY     "--.-- Wh"
+#define LVGL_DASHBOARD_PLACEHOLDER_ENERGY     "--.--- mWh"
 #define LVGL_DASHBOARD_NEUTRAL_BG_HEX         (0x5C6370U)
 #define LVGL_DASHBOARD_CONNECTING_BG_HEX      (0xF9A825U)
 #define LVGL_DASHBOARD_OFFLINE_BG_HEX         (0xC62828U)
@@ -1465,7 +1465,7 @@ static void lvgl_dashboard_on_metering_snapshot(void *arg,
     me->state_cache.voltage = snapshot->voltage;
     me->state_cache.current = snapshot->current;
     me->state_cache.power = snapshot->power;
-    me->state_cache.total_energy = snapshot->total_energy;
+    me->state_cache.energy_delta = snapshot->energy_delta;
     me->state_cache.metering_valid = snapshot->valid;
     me->state_cache.last_update_us =
         (snapshot->timestamp_us != 0ULL) ? snapshot->timestamp_us
@@ -1602,7 +1602,7 @@ static void lvgl_dashboard_apply_state(lvgl_dashboard_t *me,
             strcpy(current_text, LVGL_DASHBOARD_PLACEHOLDER_CURRENT);
         }
         if (lvgl_dashboard_internal_format_energy(
-                energy_text, sizeof(energy_text), state->total_energy) !=
+                energy_text, sizeof(energy_text), state->energy_delta) !=
             ESP_OK) {
             strcpy(energy_text, LVGL_DASHBOARD_PLACEHOLDER_ENERGY);
         }

@@ -37,6 +37,15 @@ mkdir -p "${BUILD_DIR}"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/metering" \
+    "${ROOT_DIR}/main/metering/metering_service_internal.c" \
+    "${ROOT_DIR}/test/host/test_metering_service_internal.c" \
+    -o "${BUILD_DIR}/test_metering_service_internal"
+
+"${BUILD_DIR}/test_metering_service_internal"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/app" \
     -I"${ROOT_DIR}/main/thingsboard" \
     "${ROOT_DIR}/main/thingsboard/thingsboard_client_internal.c" \

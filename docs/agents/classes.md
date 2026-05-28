@@ -882,15 +882,15 @@ network_link      (依赖: network_types.h, esp_err.h)
 
 ## 7. Metering Service（电参量业务聚合模块）
 
-Metering Service 是业务服务层的电参量聚合模块，消费 `BL0942_EVENT_MEASUREMENT` 原始测量事件，换算为工程量，维护短窗口（1 秒）聚合，并通过 esp_event 输出周期性快照。
+Metering Service 是业务服务层的电参量快照模块，消费 1 Hz `BL0942_EVENT_MEASUREMENT` 原始测量事件，换算为工程量，计算上报区间电能增量，并通过 esp_event 输出单次采样快照。
 
 ### 7.1 类总览
 
 | 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
 |----|--------|---------|---------|------|
 | `metering_service_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
-| `metering_config_t` | 用户 API | app_controller | 配置结构体 | 转换系数 + 窗口参数 |
-| `metering_snapshot_t` | 用户 API | safety_guard + thingsboard_client + display_service | 值对象 | 窗口聚合后的工程量快照 |
+| `metering_config_t` | 用户 API | app_controller | 配置结构体 | 工程量转换系数 |
+| `metering_snapshot_t` | 用户 API | safety_guard + thingsboard_client + display_service | 值对象 | 单次采样工程量快照 |
 
 ### 7.2 `metering_config_t` — 初始化配置
 
@@ -903,9 +903,6 @@ typedef struct {
     float v_rms_coeff;             // 电压转换系数 (V = raw * coeff)
     float i_rms_coeff;             // 电流转换系数 (A = raw * coeff)
     float watt_coeff;              // 功率转换系数 (W = raw * coeff)
-    float cf_coeff;                // 电能转换系数 (Wh = raw * coeff)
-    int window_samples;            // 窗口样本数（默认 10）
-    int publish_period_ms;         // 快照发布周期（默认 1000ms）
 } metering_config_t;
 ```
 
@@ -920,9 +917,10 @@ typedef struct {
     float voltage;                 // 电压 (V)
     float current;                 // 电流 (A)
     float power;                   // 有功功率 (W)
-    float total_energy;            // 累计电能 (Wh)
+    float energy_delta;            // 上报区间电能增量 (mWh)
     float frequency;               // 电网频率 (Hz)
     uint64_t timestamp_us;         // 快照时间戳
+    uint32_t energy_delta_token;   // 电能增量确认令牌
     bool valid;                    // 快照是否有效
 } metering_snapshot_t;
 ```
@@ -945,6 +943,10 @@ esp_err_t metering_service_stop(metering_service_t *me);
 esp_err_t metering_service_get_latest(metering_service_t *me,
                                        metering_snapshot_t *out);
 esp_err_t metering_service_reset_energy(metering_service_t *me);
+esp_err_t metering_service_confirm_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot);
+esp_err_t metering_service_discard_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot);
 ```
 
 **事件声明**：
@@ -953,7 +955,7 @@ esp_err_t metering_service_reset_energy(metering_service_t *me);
 ESP_EVENT_DECLARE_BASE(METERING_EVENT_BASE);
 
 typedef enum {
-    METERING_EVENT_SNAPSHOT = 0,     // 窗口聚合完成（载荷: metering_snapshot_t）
+    METERING_EVENT_SNAPSHOT = 0,     // 单次快照（载荷: metering_snapshot_t）
 } metering_event_id_t;
 ```
 
@@ -965,15 +967,12 @@ struct metering_service {
     SemaphoreHandle_t mutex;
     metering_snapshot_t latest;
     bool has_latest;
-    // 窗口聚合
-    float window_v_sum;
-    float window_i_sum;
-    float window_p_sum;
-    float window_freq_sum;
-    int window_count;
-    uint64_t window_start_us;
-    // 累计电能
-    float total_energy;
+    metering_energy_delta_state_t energy_delta_state;
+    esp_event_handler_instance_t measurement_handler;
+    esp_event_handler_instance_t fault_handler;
+    bool started;
+    bool starting;
+    bool stopping;
     bool initialized;
 };
 ```
@@ -986,12 +985,9 @@ metering_config_t cfg = {
     .v_rms_coeff       = 0.00012207f,   // 来自 BL0942 datasheet
     .i_rms_coeff       = 0.00006104f,
     .watt_coeff        = 0.00000745f,
-    .cf_coeff          = 0.00000001f,
-    .window_samples    = 10,
-    .publish_period_ms = 1000,
 };
 metering_service_t *ms = metering_service_create(&cfg);
-metering_service_start(ms);  // 开始订阅 BL0942 事件并聚合
+metering_service_start(ms);  // 开始订阅 BL0942 事件并输出 1 Hz 快照
 
 /* safety_guard（后续批次）订阅 */
 esp_event_handler_register(METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
@@ -1000,7 +996,13 @@ esp_event_handler_register(METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
 /* 主动查询最新快照 */
 metering_snapshot_t snap;
 metering_service_get_latest(ms, &snap);
-printf("Power: %.2f W, Energy: %.2f Wh\n", snap.power, snap.total_energy);
+printf("Power: %.2f W, Delta: %.3f mWh\n", snap.power, snap.energy_delta);
+
+/* 云端成功上报后确认电能增量 */
+metering_service_confirm_energy_delta(ms, &snap);
+
+/* 云端上报失败时释放 pending 增量，不推进确认基线 */
+metering_service_discard_energy_delta(ms, &snap);
 ```
 
 ### 7.5 线程模型
@@ -1011,22 +1013,23 @@ bl0942 sample task
     ▼
 metering_service（在 esp_event handler 上下文）
     │  换算 raw → 工程量
-    │  累加入当前窗口
-    │  窗口满 → 计算均值
-    │         → 发布 METERING_EVENT_SNAPSHOT
+    │  CF 计数 → 区间电能增量 mWh + 确认令牌
+    │  发布 METERING_EVENT_SNAPSHOT
     ▼
 safety_guard / thingsboard_client / display_service
 ```
 
 ### 7.6 关键设计决策
 
-- `start()` 注册 `BL0942_EVENT_MEASUREMENT` 事件处理器，在 handler 中换算并聚合
-- 窗口大小由 `window_samples` 和 bl0942 的 `sample_period_ms` 共同决定（默认 10 × 100ms = 1s）
-- 窗口内做简单算术平均（`sum / count`），不做滑动窗口或加权，降低内存和计算开销
-- `total_energy` 由 CF 脉冲累加计算，`reset_energy()` 归零（用于电量清零或切换计费周期）
+- `start()` 注册 `BL0942_EVENT_MEASUREMENT` 事件处理器，在 handler 中换算并输出单次 1 Hz 快照
+- BL0942 采样周期由组合根配置为 1000ms，Metering Service 不再做窗口聚合或均值计算
+- `energy_delta` 由内部 `metering_energy_delta_state_t` 根据 CF 计数计算，单位为 mWh
+- 云端成功发布快照后调用 `metering_service_confirm_energy_delta()` 确认令牌；未确认时新的电能快照不会覆盖 pending 结果
+- 云端发布失败后调用 `metering_service_discard_energy_delta()` 释放 pending 增量；Metering Service 不推进确认基线，下一次快照会包含从最后确认 CF 基线开始的遗漏电能
+- `reset_energy()` 清除电能增量基线和 pending 状态，用于重新建立确认起点，但不会复用已分配的确认令牌
 - bl0942 故障时发布 `valid=false` 的快照，不停止服务
 - 换算系数默认值基于 BL0942 数据手册的参考电路参数，可由调用方覆盖
-- `get_latest()` 返回最近一次有效快照的拷贝，线程安全
+- `get_latest()` 返回最近一次快照的拷贝，线程安全
 
 ---
 
@@ -1577,7 +1580,7 @@ typedef struct {
     float voltage;
     float current;
     float power;
-    float total_energy;
+    float energy_delta;                 // 上报区间电能增量 (mWh)
     bool metering_valid;
     // 继电器
     bool relay_on;
@@ -1744,7 +1747,8 @@ typedef struct {
     float voltage;                       // 电压 (V)
     float current;                       // 电流 (A)
     float power;                         // 有功功率 (W)
-    float total_energy;                  // 累计电能 (Wh)
+    float energy_delta;                  // 上报区间电能增量 (mWh)
+    float frequency;                     // 电网频率 (Hz)
     bool relay_on;                       // 继电器状态
     const char *active_link;             // "wifi" / "lte"
     safety_guard_level_t safety_level;   // 安全风险等级

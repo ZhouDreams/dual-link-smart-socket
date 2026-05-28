@@ -58,6 +58,12 @@ bool app_controller_internal_toggle_screen(bool current_enabled)
     return !current_enabled;
 }
 
+bool app_controller_internal_has_energy_delta_token(bool metering_valid,
+                                                    uint32_t token)
+{
+    return metering_valid && token != 0U;
+}
+
 void app_controller_internal_build_telemetry(
     const app_controller_telemetry_source_t *source,
     app_controller_telemetry_output_t *out)
@@ -76,7 +82,8 @@ void app_controller_internal_build_telemetry(
     out->voltage = source->voltage;
     out->current = source->current;
     out->power = source->power;
-    out->total_energy = source->total_energy;
+    out->energy_delta = source->energy_delta;
+    out->frequency = source->frequency;
     out->relay_on = source->relay_known ? source->relay_on : false;
     out->active_link = app_controller_internal_link_name(source->active_link);
     out->safety_level = source->safety_valid ? source->safety_level :

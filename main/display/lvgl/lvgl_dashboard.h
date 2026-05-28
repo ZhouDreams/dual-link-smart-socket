@@ -56,7 +56,7 @@ typedef struct {
     float voltage;                         /**< 电压 V； Voltage in volts */
     float current;                         /**< 电流 A； Current in amperes */
     float power;                           /**< 功率 W； Power in watts */
-    float total_energy;                    /**< 累计电能 Wh； Total energy in watt-hours */
+    float energy_delta;                    /**< 电能增量 mWh； Energy delta in milliwatt-hours */
     bool metering_valid;                   /**< 电参量是否有效； Whether metering data is valid */
     bool relay_on;                         /**< 继电器是否打开； Whether relay is on */
     bool relay_known;                      /**< 继电器状态是否已知； Whether relay state is known */

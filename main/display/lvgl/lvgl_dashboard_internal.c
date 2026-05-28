@@ -170,7 +170,7 @@ esp_err_t lvgl_dashboard_internal_format_current(char *out, size_t out_len,
 }
 
 esp_err_t lvgl_dashboard_internal_format_energy(char *out, size_t out_len,
-                                                float energy_wh)
+                                                float energy_mwh)
 {
     int written = 0;
 
@@ -178,7 +178,7 @@ esp_err_t lvgl_dashboard_internal_format_energy(char *out, size_t out_len,
         return ESP_ERR_INVALID_ARG;
     }
 
-    written = snprintf(out, out_len, "%.2f Wh", energy_wh);
+    written = snprintf(out, out_len, "%.3f mWh", energy_mwh);
     if (written < 0 || (size_t)written >= out_len) {
         return ESP_ERR_INVALID_SIZE;
     }

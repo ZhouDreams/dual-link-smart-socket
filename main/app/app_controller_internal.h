@@ -17,6 +17,7 @@ extern "C" {
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "network_types.h"
@@ -38,7 +39,8 @@ typedef struct {
     float voltage;                         /**< 电压； Voltage */
     float current;                         /**< 电流； Current */
     float power;                           /**< 功率； Power */
-    float total_energy;                    /**< 总电量； Total energy */
+    float energy_delta;                    /**< 电能增量 mWh； Energy delta in milliwatt-hours */
+    float frequency;                       /**< 电网频率 Hz； Grid frequency in hertz */
     bool metering_valid;                   /**< 计量是否有效； Whether metering is valid */
     bool relay_on;                         /**< 继电器状态； Relay state */
     bool relay_known;                      /**< 继电器状态是否已知； Whether relay state is known */
@@ -55,7 +57,8 @@ typedef struct {
     float voltage;                         /**< 电压； Voltage */
     float current;                         /**< 电流； Current */
     float power;                           /**< 功率； Power */
-    float total_energy;                    /**< 总电量； Total energy */
+    float energy_delta;                    /**< 电能增量 mWh； Energy delta in milliwatt-hours */
+    float frequency;                       /**< 电网频率 Hz； Grid frequency in hertz */
     bool relay_on;                         /**< 继电器状态； Relay state */
     const char *active_link;               /**< 当前链路名称； Active link name */
     safety_guard_level_t safety_level;     /**< 安全等级； Safety level */
@@ -77,6 +80,13 @@ const char *app_controller_internal_link_name(network_link_type_t link_type);
  * @details Toggle screen enabled state
  */
 bool app_controller_internal_toggle_screen(bool current_enabled);
+
+/**
+ * @brief 判断是否携带待确认电能令牌
+ * @details Check whether telemetry carries a confirmable energy token
+ */
+bool app_controller_internal_has_energy_delta_token(bool metering_valid,
+                                                    uint32_t token);
 
 /**
  * @brief 构建应用遥测输出

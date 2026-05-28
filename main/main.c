@@ -103,13 +103,11 @@ void app_main(void)
         .device_address = 0,
         .rx_buf_size = 256,
         .read_timeout_ms = 500,
-        .sample_period_ms = 100,
+        .sample_period_ms = 1000,
         .fault_threshold = 10,
         .hard_reset_max_attempts = 3,
     });
     metering_service_t *metering = metering_service_create(&(metering_config_t) {
-        .window_samples = 10,
-        .publish_period_ms = 1000,
     });
     safety_guard_t *safety = safety_guard_create(&(safety_guard_config_t) {
         .overcurrent_threshold_a = 10.0f,

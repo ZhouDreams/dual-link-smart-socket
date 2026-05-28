@@ -28,7 +28,8 @@ static void test_build_telemetry(void)
         .voltage = 229.5f,
         .current = 1.25f,
         .power = 286.8f,
-        .total_energy = 42.75f,
+        .energy_delta = 3.125f,
+        .frequency = 50.01f,
         .metering_valid = true,
         .relay_on = true,
         .relay_known = true,
@@ -45,12 +46,21 @@ static void test_build_telemetry(void)
     assert(out.current < 1.26f);
     assert(out.power > 286.7f);
     assert(out.power < 286.9f);
-    assert(out.total_energy > 42.7f);
-    assert(out.total_energy < 42.8f);
+    assert(out.energy_delta > 3.124f);
+    assert(out.energy_delta < 3.126f);
+    assert(out.frequency > 50.00f);
+    assert(out.frequency < 50.02f);
     assert(out.relay_on == true);
     assert(strcmp(out.active_link, "lte") == 0);
     assert(out.safety_level == SAFETY_GUARD_LEVEL_NORMAL);
     assert(out.valid == true);
+}
+
+static void test_energy_delta_token_presence(void)
+{
+    assert(app_controller_internal_has_energy_delta_token(true, 1U) == true);
+    assert(app_controller_internal_has_energy_delta_token(true, 0U) == false);
+    assert(app_controller_internal_has_energy_delta_token(false, 1U) == false);
 }
 
 static void test_power_limit_response(void)
@@ -75,6 +85,7 @@ int main(void)
     test_link_names();
     test_toggle_screen();
     test_build_telemetry();
+    test_energy_delta_token_presence();
     test_power_limit_response();
 
     printf("app controller internal tests passed\n");

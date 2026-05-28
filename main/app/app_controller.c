@@ -185,6 +185,14 @@ static esp_err_t app_controller_publish_telemetry(
     app_controller_t *me, const metering_snapshot_t *snapshot);
 
 /**
+ * @brief 放弃未上报的电能增量
+ * @details Discard unpublished energy delta token without advancing baseline
+ */
+static void app_controller_discard_energy_delta(
+    app_controller_t *me, const metering_snapshot_t *snapshot,
+    const char *reason);
+
+/**
  * @brief 记录首个错误
  * @details Capture first error
  */
@@ -486,7 +494,11 @@ static void app_controller_on_metering_snapshot(void *handler_args,
     metering_snapshot_t *snapshot = (metering_snapshot_t *)event_data;
 
     if (event_base != METERING_EVENT_BASE || event_id != METERING_EVENT_SNAPSHOT ||
-        snapshot == NULL || !app_controller_is_running(me)) {
+        snapshot == NULL || me == NULL) {
+        return;
+    }
+    if (!app_controller_is_running(me)) {
+        app_controller_discard_energy_delta(me, snapshot, "controller not running");
         return;
     }
 
@@ -969,6 +981,10 @@ static esp_err_t app_controller_publish_telemetry(
     ESP_RETURN_ON_FALSE(me != NULL && snapshot != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "telemetry args are null");
 
+    const bool has_energy_delta_token =
+        app_controller_internal_has_energy_delta_token(
+            snapshot->valid, snapshot->energy_delta_token);
+
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
         relay_on = me->relay_on;
         relay_known = me->relay_known;
@@ -990,7 +1006,8 @@ static esp_err_t app_controller_publish_telemetry(
     source.voltage = snapshot->voltage;
     source.current = snapshot->current;
     source.power = snapshot->power;
-    source.total_energy = snapshot->total_energy;
+    source.energy_delta = snapshot->energy_delta;
+    source.frequency = snapshot->frequency;
     source.metering_valid = snapshot->valid;
     source.relay_on = relay_on;
     source.relay_known = relay_known;
@@ -1002,7 +1019,8 @@ static esp_err_t app_controller_publish_telemetry(
     input.voltage = output.voltage;
     input.current = output.current;
     input.power = output.power;
-    input.total_energy = output.total_energy;
+    input.energy_delta = output.energy_delta;
+    input.frequency = output.frequency;
     input.relay_on = output.relay_on;
     input.active_link = output.active_link;
     input.safety_level = output.safety_level;
@@ -1010,14 +1028,52 @@ static esp_err_t app_controller_publish_telemetry(
 
     ret = thingsboard_client_publish_telemetry(me->cfg.tb, &input);
     if (ret == ESP_OK) {
+        if (has_energy_delta_token) {
+            const esp_err_t confirm_ret =
+                metering_service_confirm_energy_delta(me->cfg.metering, snapshot);
+            if (confirm_ret != ESP_OK) {
+                ESP_LOGW(TAG, "confirm energy delta failed: %s",
+                         esp_err_to_name(confirm_ret));
+            }
+        }
         s_telemetry_publish_count++;
-        ESP_LOGI(TAG, "telemetry publish #%lu ok: energy=%.3f Wh link=%s",
+        ESP_LOGI(TAG,
+                 "telemetry publish #%lu ok: V=%.2fV I=%.3fA P=%.2fW E=%.3fmWh F=%.2fHz valid=%d link=%s",
                  (unsigned long)s_telemetry_publish_count,
-                 (double)input.total_energy,
-                 input.active_link);
+                 (double)input.voltage,
+                 (double)input.current,
+                 (double)input.power,
+                 (double)input.energy_delta,
+                 (double)input.frequency,
+                  input.valid ? 1 : 0,
+                  input.active_link);
+    } else {
+        if (has_energy_delta_token) {
+            app_controller_discard_energy_delta(me, snapshot, "publish failed");
+        }
     }
 
     return ret;
+}
+
+static void app_controller_discard_energy_delta(
+    app_controller_t *me, const metering_snapshot_t *snapshot,
+    const char *reason)
+{
+    if (me == NULL || snapshot == NULL ||
+        !app_controller_internal_has_energy_delta_token(
+            snapshot->valid, snapshot->energy_delta_token)) {
+        return;
+    }
+
+    const esp_err_t discard_ret =
+        metering_service_discard_energy_delta(me->cfg.metering, snapshot);
+    if (discard_ret != ESP_OK) {
+        ESP_LOGW(TAG, "discard energy delta failed%s%s: %s",
+                 (reason != NULL) ? " after " : "",
+                 (reason != NULL) ? reason : "",
+                 esp_err_to_name(discard_ret));
+    }
 }
 
 static void app_controller_capture_first_error(esp_err_t ret,

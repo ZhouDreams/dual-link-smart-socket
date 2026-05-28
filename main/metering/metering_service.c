@@ -12,6 +12,8 @@
 
 #include "metering_service.h"
 
+#include "metering_service_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,8 +30,6 @@
 
 #define TAG "metering_service"
 
-#define METERING_DEFAULT_WINDOW_SAMPLES      (10)
-#define METERING_DEFAULT_PUBLISH_PERIOD_MS   (1000)
 #define METERING_EVENT_POST_TIMEOUT_MS       (10)
 
 #define METERING_VREF_MV         (1218)
@@ -43,9 +43,6 @@
 #define METERING_POWER_NUM       (2679285553LL)
 #define METERING_POWER_DEN       (50107500000LL)
 #define METERING_FREQ_CLOCK_HZ   (1000000UL)
-#define METERING_CF_CNT_U24_MASK (0x00FFFFFFUL)
-#define METERING_PULSE_ENERGY_NWH (62297938ULL)
-#define METERING_NWH_PER_WH      (1000000000ULL)
 
 ESP_EVENT_DEFINE_BASE(METERING_EVENT_BASE);
 
@@ -68,19 +65,9 @@ struct metering_service {
     SemaphoreHandle_t mutex;
     metering_snapshot_t latest;
     bool has_latest;
-    float window_v_sum;
-    float window_i_sum;
-    float window_p_sum;
-    float window_freq_sum;
-    int window_count;
-    uint64_t window_start_us;
-    uint64_t window_last_us;
-    float total_energy;
-    uint64_t total_energy_nwh;
-    uint32_t last_cf_cnt_raw;
+    metering_energy_delta_state_t energy_delta_state;
     esp_event_handler_instance_t measurement_handler;
     esp_event_handler_instance_t fault_handler;
-    bool have_last_cf_cnt_raw;
     bool started;
     bool starting;
     bool stopping;
@@ -128,24 +115,6 @@ static void metering_convert_default(const bl0942_measurement_t *in,
 static void metering_convert_with_config(const metering_service_t *me,
                                          const bl0942_measurement_t *in,
                                          metering_snapshot_t *out);
-
-/**
- * @brief 计算 24 位计数器增量
- * @details Compute wrap-safe delta for a 24-bit counter
- * @param[in] current 当前计数
- * @param[in] previous 上一次计数
- * @return 24 位计数器增量
- */
-static uint32_t metering_u24_delta(uint32_t current, uint32_t previous);
-
-/**
- * @brief 更新累计电能
- * @details Update accumulated energy from CF counter while locked
- * @param[in,out] me 电参量服务句柄
- * @param[in] cf_cnt_raw 原始 CF 计数
- */
-static void metering_update_energy_locked(metering_service_t *me,
-                                          uint32_t cf_cnt_raw);
 
 /**
  * @brief 处理 BL0942 测量事件
@@ -208,6 +177,7 @@ metering_service_t *metering_service_create(const metering_config_t *config)
     }
 
     me->config = resolved;
+    metering_energy_delta_state_init(&me->energy_delta_state);
     me->mutex = xSemaphoreCreateMutex();
     if (me->mutex == NULL) {
         ESP_LOGE(TAG, "create mutex failed");
@@ -441,16 +411,60 @@ esp_err_t metering_service_reset_energy(metering_service_t *me)
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
-    me->total_energy = 0.0f;
-    me->total_energy_nwh = 0ULL;
-    me->last_cf_cnt_raw = 0U;
-    me->have_last_cf_cnt_raw = false;
+    metering_energy_delta_reset_baseline(&me->energy_delta_state);
     if (me->has_latest) {
-        me->latest.total_energy = 0.0f;
+        me->latest.energy_delta = 0.0f;
+        me->latest.energy_delta_token = 0U;
     }
 
     (void)xSemaphoreGive(me->mutex);
     return ESP_OK;
+}
+
+esp_err_t metering_service_confirm_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot)
+{
+    esp_err_t ret = ESP_OK;
+
+    ESP_RETURN_ON_FALSE(me != NULL && snapshot != NULL, ESP_ERR_INVALID_ARG,
+                        TAG, "confirm args are null");
+    ESP_RETURN_ON_FALSE(snapshot->valid, ESP_ERR_INVALID_ARG, TAG,
+                        "snapshot is invalid");
+    ESP_RETURN_ON_FALSE(me->initialized, ESP_ERR_INVALID_STATE, TAG,
+                        "service is not initialized");
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+
+    ret = metering_energy_delta_confirm(&me->energy_delta_state,
+                                        snapshot->energy_delta_token);
+
+    (void)xSemaphoreGive(me->mutex);
+    return ret;
+}
+
+esp_err_t metering_service_discard_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot)
+{
+    esp_err_t ret = ESP_OK;
+
+    ESP_RETURN_ON_FALSE(me != NULL && snapshot != NULL, ESP_ERR_INVALID_ARG,
+                        TAG, "discard args are null");
+    ESP_RETURN_ON_FALSE(snapshot->valid, ESP_ERR_INVALID_ARG, TAG,
+                        "snapshot is invalid");
+    ESP_RETURN_ON_FALSE(me->initialized, ESP_ERR_INVALID_STATE, TAG,
+                        "service is not initialized");
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+
+    ret = metering_energy_delta_discard(&me->energy_delta_state,
+                                        snapshot->energy_delta_token);
+
+    (void)xSemaphoreGive(me->mutex);
+    return ret;
 }
 
 /**********************
@@ -469,48 +483,6 @@ static void metering_apply_defaults(const metering_config_t *config,
     } else {
         memset(out, 0, sizeof(*out));
     }
-
-    if (out->window_samples <= 0) {
-        out->window_samples = METERING_DEFAULT_WINDOW_SAMPLES;
-    }
-    if (out->publish_period_ms <= 0) {
-        out->publish_period_ms = METERING_DEFAULT_PUBLISH_PERIOD_MS;
-    }
-}
-
-static uint32_t metering_u24_delta(uint32_t current, uint32_t previous)
-{
-    current &= METERING_CF_CNT_U24_MASK;
-    previous &= METERING_CF_CNT_U24_MASK;
-    return (current - previous) & METERING_CF_CNT_U24_MASK;
-}
-
-static void metering_update_energy_locked(metering_service_t *me,
-                                           uint32_t cf_cnt_raw)
-{
-    if (me == NULL) {
-        return;
-    }
-
-    cf_cnt_raw &= METERING_CF_CNT_U24_MASK;
-    if (!me->have_last_cf_cnt_raw) {
-        me->last_cf_cnt_raw = cf_cnt_raw;
-        me->have_last_cf_cnt_raw = true;
-        return;
-    }
-
-    const uint32_t delta = metering_u24_delta(cf_cnt_raw,
-                                              me->last_cf_cnt_raw);
-    me->last_cf_cnt_raw = cf_cnt_raw;
-
-    if (me->config.cf_coeff > 0.0f) {
-        me->total_energy += (float)delta * me->config.cf_coeff;
-        return;
-    }
-
-    me->total_energy_nwh += (uint64_t)delta * METERING_PULSE_ENERGY_NWH;
-    me->total_energy = (float)((double)me->total_energy_nwh /
-                               (double)METERING_NWH_PER_WH);
 }
 
 static void metering_convert_default(const bl0942_measurement_t *in,
@@ -527,9 +499,9 @@ static void metering_convert_default(const bl0942_measurement_t *in,
         return;
     }
 
-    const uint32_t i_rms_raw = in->i_rms_raw & METERING_CF_CNT_U24_MASK;
-    const uint32_t v_rms_raw = in->v_rms_raw & METERING_CF_CNT_U24_MASK;
-    const uint32_t cf_cnt_raw = in->cf_cnt_raw & METERING_CF_CNT_U24_MASK;
+    const uint32_t i_rms_raw = in->i_rms_raw & METERING_ENERGY_CF_CNT_U24_MASK;
+    const uint32_t v_rms_raw = in->v_rms_raw & METERING_ENERGY_CF_CNT_U24_MASK;
+    const uint32_t cf_cnt_raw = in->cf_cnt_raw & METERING_ENERGY_CF_CNT_U24_MASK;
 
     out->current_ma = (int32_t)(((int64_t)i_rms_raw * METERING_VREF_MV) /
                                 ((int64_t)METERING_KI_SCALE * METERING_RL_MILLIOHM));
@@ -584,8 +556,8 @@ static void metering_convert_with_config(const metering_service_t *me,
         return;
     }
 
-    i_rms_raw = in->i_rms_raw & METERING_CF_CNT_U24_MASK;
-    v_rms_raw = in->v_rms_raw & METERING_CF_CNT_U24_MASK;
+    i_rms_raw = in->i_rms_raw & METERING_ENERGY_CF_CNT_U24_MASK;
+    v_rms_raw = in->v_rms_raw & METERING_ENERGY_CF_CNT_U24_MASK;
 
     out->voltage = (me->config.v_rms_coeff > 0.0f) ?
                    ((float)v_rms_raw * me->config.v_rms_coeff) :
@@ -637,7 +609,9 @@ static esp_err_t metering_run_conversion_selftest(void)
         .valid = true,
     };
     metering_fixed_sample_t out = {0};
-    metering_service_t energy_test = {0};
+    metering_energy_delta_state_t energy_state = {0};
+    metering_energy_delta_result_t first_delta = {0};
+    metering_energy_delta_result_t second_delta = {0};
 
     metering_convert_default(&golden, &out);
     ESP_RETURN_ON_FALSE(out.current_ma >= 994 && out.current_ma <= 1004,
@@ -657,25 +631,22 @@ static esp_err_t metering_run_conversion_selftest(void)
     ESP_RETURN_ON_FALSE(out.power_cw == 0,
                         ESP_FAIL, TAG, "negative power self-test failed");
 
-    metering_update_energy_locked(&energy_test, 10U);
-    ESP_RETURN_ON_FALSE(energy_test.have_last_cf_cnt_raw &&
-                            energy_test.last_cf_cnt_raw == 10U &&
-                            energy_test.total_energy_nwh == 0ULL &&
-                            energy_test.total_energy == 0.0f,
+    metering_energy_delta_state_init(&energy_state);
+    ESP_RETURN_ON_FALSE(metering_energy_delta_prepare(&energy_state, 10U,
+                                                      &first_delta) == ESP_OK,
+                        ESP_FAIL, TAG, "energy baseline prepare failed");
+    ESP_RETURN_ON_FALSE(first_delta.energy_delta_mwh == 0.0f &&
+                            first_delta.token != 0U,
                         ESP_FAIL, TAG, "energy baseline self-test failed");
-
-    metering_update_energy_locked(&energy_test, 12U);
-    ESP_RETURN_ON_FALSE(energy_test.total_energy_nwh ==
-                            (2ULL * METERING_PULSE_ENERGY_NWH),
-                        ESP_FAIL, TAG, "energy nWh self-test failed");
-
-    memset(&energy_test, 0, sizeof(energy_test));
-    energy_test.config.cf_coeff = 0.5f;
-    metering_update_energy_locked(&energy_test, 0x00FFFFFEUL);
-    metering_update_energy_locked(&energy_test, 1U);
-    ESP_RETURN_ON_FALSE(energy_test.total_energy > 1.49f &&
-                            energy_test.total_energy < 1.51f,
-                        ESP_FAIL, TAG, "energy coefficient wrap self-test failed");
+    ESP_RETURN_ON_FALSE(metering_energy_delta_confirm(&energy_state,
+                                                      first_delta.token) == ESP_OK,
+                        ESP_FAIL, TAG, "energy baseline confirm failed");
+    ESP_RETURN_ON_FALSE(metering_energy_delta_prepare(&energy_state, 12U,
+                                                      &second_delta) == ESP_OK,
+                        ESP_FAIL, TAG, "energy delta prepare failed");
+    ESP_RETURN_ON_FALSE(second_delta.energy_delta_mwh > 124.594f &&
+                            second_delta.energy_delta_mwh < 124.596f,
+                        ESP_FAIL, TAG, "energy delta self-test failed");
 
     return ESP_OK;
 }
@@ -688,6 +659,7 @@ static void metering_on_bl0942_measurement(void *arg, esp_event_base_t base,
         (const bl0942_measurement_t *)event_data;
     metering_snapshot_t sample = {0};
     metering_snapshot_t snapshot = {0};
+    metering_energy_delta_result_t energy_delta = {0};
     bool emit = false;
 
     (void)base;
@@ -710,58 +682,32 @@ static void metering_on_bl0942_measurement(void *arg, esp_event_base_t base,
         return;
     }
 
-    metering_update_energy_locked(me, measurement->cf_cnt_raw);
-    sample.total_energy = me->total_energy;
-
-    if (me->window_count == 0) {
-        me->window_start_us = sample.timestamp_us;
+    if (metering_energy_delta_prepare(&me->energy_delta_state,
+                                      measurement->cf_cnt_raw,
+                                      &energy_delta) != ESP_OK) {
+        (void)xSemaphoreGive(me->mutex);
+        return;
     }
-    me->window_last_us = sample.timestamp_us;
-    me->window_v_sum += sample.voltage;
-    me->window_i_sum += sample.current;
-    me->window_p_sum += sample.power;
-    me->window_freq_sum += sample.frequency;
-    me->window_count++;
+    sample.energy_delta = energy_delta.energy_delta_mwh;
+    sample.energy_delta_token = energy_delta.token;
 
-    const uint64_t elapsed_us = (me->window_last_us >= me->window_start_us) ?
-                                (me->window_last_us - me->window_start_us) :
-                                0ULL;
-    if (me->window_count >= me->config.window_samples ||
-        elapsed_us >= ((uint64_t)me->config.publish_period_ms * 1000ULL)) {
-        snapshot.voltage = me->window_v_sum / (float)me->window_count;
-        snapshot.current = me->window_i_sum / (float)me->window_count;
-        snapshot.power = me->window_p_sum / (float)me->window_count;
-        snapshot.frequency = me->window_freq_sum / (float)me->window_count;
-        snapshot.total_energy = me->total_energy;
-        snapshot.timestamp_us = me->window_last_us;
-        snapshot.valid = true;
-
-        me->latest = snapshot;
-        me->has_latest = true;
-        me->window_v_sum = 0.0f;
-        me->window_i_sum = 0.0f;
-        me->window_p_sum = 0.0f;
-        me->window_freq_sum = 0.0f;
-        me->window_count = 0;
-        me->window_start_us = 0ULL;
-        me->window_last_us = 0ULL;
-        emit = true;
-    }
+    me->latest = sample;
+    me->has_latest = true;
+    snapshot = sample;
+    emit = true;
     (void)xSemaphoreGive(me->mutex);
 
     if (emit) {
         s_snapshot_log_count++;
-        if ((s_snapshot_log_count % 10U) == 0U) {
-            ESP_LOGI(TAG,
-                     "metering snapshot #%lu: V=%.2fV I=%.3fA P=%.2fW E=%.3fWh F=%.2fHz valid=%d",
-                     (unsigned long)s_snapshot_log_count,
-                     (double)snapshot.voltage,
-                     (double)snapshot.current,
-                     (double)snapshot.power,
-                     (double)snapshot.total_energy,
-                     (double)snapshot.frequency,
-                     snapshot.valid ? 1 : 0);
-        }
+        ESP_LOGI(TAG,
+                 "metering snapshot #%lu: V=%.2fV I=%.3fA P=%.2fW E=%.3fmWh F=%.2fHz valid=%d",
+                 (unsigned long)s_snapshot_log_count,
+                 (double)snapshot.voltage,
+                 (double)snapshot.current,
+                 (double)snapshot.power,
+                 (double)snapshot.energy_delta,
+                 (double)snapshot.frequency,
+                 snapshot.valid ? 1 : 0);
         metering_post_snapshot(&snapshot);
     }
 }
@@ -792,13 +738,13 @@ static void metering_on_bl0942_fault(void *arg, esp_event_base_t base,
         snapshot = me->latest;
     }
     if (fault_info != NULL && fault_info->hard_reset_attempted) {
-        me->have_last_cf_cnt_raw = false;
-        me->last_cf_cnt_raw = 0U;
+        metering_energy_delta_reset_baseline(&me->energy_delta_state);
     }
     snapshot.timestamp_us = (snapshot.timestamp_us != 0ULL) ?
                             snapshot.timestamp_us :
                             (uint64_t)esp_timer_get_time();
-    snapshot.total_energy = me->total_energy;
+    snapshot.energy_delta = 0.0f;
+    snapshot.energy_delta_token = 0U;
     snapshot.valid = false;
     me->latest = snapshot;
     me->has_latest = true;

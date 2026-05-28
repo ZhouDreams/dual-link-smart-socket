@@ -156,14 +156,14 @@ esp_err_t lvgl_dashboard_internal_format_current(char *out, size_t out_len,
  * @details Format energy text
  * @param[out] out 输出缓冲区； Writable destination buffer
  * @param[in] out_len 输出缓冲区长度； Destination buffer length
- * @param[in] energy_wh 电能 Wh； Energy in watt-hours
+ * @param[in] energy_mwh 电能增量 mWh； Energy delta in milliwatt-hours
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_SIZE: 缓冲区过小； Buffer too small
  */
 esp_err_t lvgl_dashboard_internal_format_energy(char *out, size_t out_len,
-                                                float energy_wh);
+                                                float energy_mwh);
 
 /**********************
  *      MACROS

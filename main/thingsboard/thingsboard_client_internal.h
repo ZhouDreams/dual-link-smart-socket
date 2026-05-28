@@ -62,10 +62,11 @@ typedef struct {
  * @details ThingsBoard telemetry input
  */
 typedef struct {
-    float voltage;                         /**< 电压； Voltage */
-    float current;                         /**< 电流； Current */
-    float power;                           /**< 功率； Power */
-    float total_energy;                    /**< 总电量； Total energy */
+    float voltage;                         /**< 电压 V； Voltage in volts */
+    float current;                         /**< 电流 A； Current in amperes */
+    float power;                           /**< 功率 W； Power in watts */
+    float energy_delta;                    /**< 上报区间电能增量 mWh； Interval energy delta in milliwatt-hours */
+    float frequency;                       /**< 电网频率 Hz； Grid frequency in hertz */
     bool relay_on;                         /**< 继电器状态； Relay state */
     const char *active_link;               /**< 当前链路； Active link */
     safety_guard_level_t safety_level;     /**< 安全等级； Safety level */

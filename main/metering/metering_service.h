@@ -43,9 +43,6 @@ typedef struct {
     float v_rms_coeff;       /**< 电压转换系数； Voltage conversion coefficient */
     float i_rms_coeff;       /**< 电流转换系数； Current conversion coefficient */
     float watt_coeff;        /**< 功率转换系数； Power conversion coefficient */
-    float cf_coeff;          /**< 电能转换系数 Wh/pulse； Energy coefficient in Wh per pulse */
-    int window_samples;      /**< 聚合窗口样本数； Aggregation window sample count */
-    int publish_period_ms;   /**< 快照发布周期； Snapshot publish period in milliseconds */
 } metering_config_t;
 
 /**
@@ -53,13 +50,14 @@ typedef struct {
  * @details Metering snapshot
  */
 typedef struct {
-    float voltage;            /**< 电压 V； Voltage in volts */
-    float current;            /**< 电流 A； Current in amperes */
-    float power;              /**< 有功功率 W； Active power in watts */
-    float total_energy;       /**< 累计电能 Wh； Total energy in watt-hours */
-    float frequency;          /**< 电网频率 Hz； Grid frequency in hertz */
-    uint64_t timestamp_us;    /**< 快照时间戳； Snapshot timestamp in microseconds */
-    bool valid;               /**< 快照是否有效； Whether snapshot is valid */
+    float voltage;              /**< 电压 V； Voltage in volts */
+    float current;              /**< 电流 A； Current in amperes */
+    float power;                /**< 有功功率 W； Active power in watts */
+    float energy_delta;         /**< 上报区间电能增量 mWh； Interval energy delta in milliwatt-hours */
+    float frequency;            /**< 电网频率 Hz； Grid frequency in hertz */
+    uint64_t timestamp_us;      /**< 快照时间戳； Snapshot timestamp in microseconds */
+    uint32_t energy_delta_token;/**< 电能增量确认令牌； Energy delta confirmation token */
+    bool valid;                 /**< 快照是否有效； Whether snapshot is valid */
 } metering_snapshot_t;
 
 /**
@@ -73,7 +71,7 @@ ESP_EVENT_DECLARE_BASE(METERING_EVENT_BASE);
  * @details Metering event ID
  */
 typedef enum {
-    METERING_EVENT_SNAPSHOT = 0, /**< 聚合快照； Aggregated snapshot */
+    METERING_EVENT_SNAPSHOT = 0, /**< 单次快照； Single sample snapshot */
 } metering_event_id_t;
 
 /**********************
@@ -137,8 +135,8 @@ esp_err_t metering_service_get_latest(metering_service_t *me,
                                       metering_snapshot_t *out);
 
 /**
- * @brief 重置累计电能
- * @details Reset accumulated energy
+ * @brief 重置电能增量基准
+ * @details Reset the energy delta baseline
  * @param[in] me 服务句柄
  * @return
  *         - ESP_OK: 成功
@@ -147,6 +145,34 @@ esp_err_t metering_service_get_latest(metering_service_t *me,
  *         - ESP_ERR_TIMEOUT: 等待资源超时
  */
 esp_err_t metering_service_reset_energy(metering_service_t *me);
+
+/**
+ * @brief 确认电能增量已成功上报
+ * @details Confirm that a snapshot energy delta was published successfully
+ * @param[in] me 服务句柄
+ * @param[in] snapshot 已成功上报的快照
+ * @return
+ *         - ESP_OK: 成功
+ *         - ESP_ERR_INVALID_ARG: 参数无效
+ *         - ESP_ERR_INVALID_STATE: 服务状态无效或令牌无效
+ *         - ESP_ERR_TIMEOUT: 等待资源超时
+ */
+esp_err_t metering_service_confirm_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot);
+
+/**
+ * @brief 丢弃未成功上报的电能增量
+ * @details Release a failed-publish energy delta without advancing the confirmed baseline
+ * @param[in] me 服务句柄
+ * @param[in] snapshot 未成功上报的快照
+ * @return
+ *         - ESP_OK: 成功
+ *         - ESP_ERR_INVALID_ARG: 参数无效
+ *         - ESP_ERR_INVALID_STATE: 服务状态无效或令牌无效
+ *         - ESP_ERR_TIMEOUT: 等待资源超时
+ */
+esp_err_t metering_service_discard_energy_delta(
+    metering_service_t *me, const metering_snapshot_t *snapshot);
 
 /**********************
  *      MACROS

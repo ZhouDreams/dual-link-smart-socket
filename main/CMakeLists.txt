@@ -16,6 +16,7 @@ idf_component_register(
         "button/button_iot_adapter.c"
         "button/button.c"
         "bl0942/bl0942.c"
+        "metering/metering_service_internal.c"
         "metering/metering_service.c"
         "safety/safety_guard.c"
         "display/tft/tft_panel.c"
