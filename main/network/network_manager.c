@@ -37,6 +37,7 @@
 #define NETWORK_MANAGER_TASK_PRIORITY             (4)
 #define NETWORK_MANAGER_STOP_TIMEOUT_MS           (3000U)
 #define NETWORK_MANAGER_STOP_POLL_MS              (100U)
+#define NETWORK_MANAGER_RX_CB_POLL_MS             (10U)
 
 /**********************
  *      TYPEDEFS
@@ -77,6 +78,7 @@ struct network_manager {
     SemaphoreHandle_t mutex;
     network_rx_cb_t rx_cb;
     void *rx_ctx;
+    int active_rx_callbacks;
     uint64_t failback_since_us;
     TaskHandle_t monitor_task;
     SemaphoreHandle_t monitor_task_done_sema;
@@ -707,8 +709,20 @@ esp_err_t network_manager_register_rx_cb(network_manager_t *me,
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
-    me->rx_cb = cb;
-    me->rx_ctx = (cb != NULL) ? ctx : NULL;
+    if (cb == NULL) {
+        me->rx_cb = NULL;
+        me->rx_ctx = NULL;
+        while (me->active_rx_callbacks > 0) {
+            (void)xSemaphoreGive(me->mutex);
+            vTaskDelay(pdMS_TO_TICKS(NETWORK_MANAGER_RX_CB_POLL_MS));
+            ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                                ESP_ERR_TIMEOUT, TAG,
+                                "take mutex failed");
+        }
+    } else {
+        me->rx_cb = cb;
+        me->rx_ctx = ctx;
+    }
 
     (void)xSemaphoreGive(me->mutex);
     return ESP_OK;
@@ -1236,9 +1250,16 @@ static void network_manager_on_link_rx(const network_rx_data_t *rx_data,
     if (me->destroying) {
         rx_cb = NULL;
     }
+    if (source_link == active && rx_cb != NULL) {
+        me->active_rx_callbacks++;
+    }
     (void)xSemaphoreGive(me->mutex);
 
     if (source_link == active && rx_cb != NULL) {
         rx_cb(rx_data, rx_ctx);
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+            me->active_rx_callbacks--;
+            (void)xSemaphoreGive(me->mutex);
+        }
     }
 }

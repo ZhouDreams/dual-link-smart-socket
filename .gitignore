@@ -20,3 +20,6 @@ reference/
 # IDE
 .vscode/
 .idea/
+.opencode/
+.cache/
+.claude/

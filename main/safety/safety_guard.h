@@ -176,6 +176,22 @@ esp_err_t safety_guard_set_thresholds(safety_guard_t *me,
                                       float overcurrent_a,
                                       float overpower_w);
 
+/**
+ * @brief 获取安全阈值
+ * @details Get safety thresholds
+ * @param[in] me 安全规则句柄； Safety guard handle
+ * @param[out] out_overcurrent_a 过流阈值 A，可为 NULL； Overcurrent threshold, may be NULL
+ * @param[out] out_overpower_w 过功率阈值 W，可为 NULL； Overpower threshold, may be NULL
+ * @return
+ *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 获取互斥锁超时； Mutex timeout
+ */
+esp_err_t safety_guard_get_thresholds(safety_guard_t *me,
+                                      float *out_overcurrent_a,
+                                      float *out_overpower_w);
+
 /**********************
  *      MACROS
  **********************/

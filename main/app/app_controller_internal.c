@@ -1,0 +1,100 @@
+/**
+ * @file app_controller_internal.c
+ * @brief 应用控制器内部辅助实现
+ * @details App controller internal helper implementation
+ * @author OpenCode
+ * @date 2026-05-28
+ */
+
+/*********************
+ *      INCLUDES
+ *********************/
+
+#include "app_controller_internal.h"
+
+#include <string.h>
+
+#include "thingsboard_client_internal.h"
+
+/*********************
+ *      DEFINES
+ *********************/
+
+/**********************
+ *      TYPEDEFS
+ **********************/
+
+/**********************
+ *  STATIC PROTOTYPES
+ **********************/
+
+/**********************
+ *  STATIC VARIABLES
+ **********************/
+
+/**********************
+ *      MACROS
+ **********************/
+
+/**********************
+ *   GLOBAL FUNCTIONS
+ **********************/
+
+const char *app_controller_internal_link_name(network_link_type_t link_type)
+{
+    switch (link_type) {
+    case NETWORK_LINK_TYPE_WIFI:
+        return "wifi";
+    case NETWORK_LINK_TYPE_LTE:
+        return "lte";
+    case NETWORK_LINK_TYPE_NONE:
+    default:
+        return "none";
+    }
+}
+
+bool app_controller_internal_toggle_screen(bool current_enabled)
+{
+    return !current_enabled;
+}
+
+void app_controller_internal_build_telemetry(
+    const app_controller_telemetry_source_t *source,
+    app_controller_telemetry_output_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->active_link = "none";
+
+    if (source == NULL) {
+        return;
+    }
+
+    out->voltage = source->voltage;
+    out->current = source->current;
+    out->power = source->power;
+    out->total_energy = source->total_energy;
+    out->relay_on = source->relay_known ? source->relay_on : false;
+    out->active_link = app_controller_internal_link_name(source->active_link);
+    out->safety_level = source->safety_valid ? source->safety_level :
+                        SAFETY_GUARD_LEVEL_WARNING;
+    out->valid = source->metering_valid;
+}
+
+esp_err_t app_controller_internal_format_power_limit_response(
+    char *buf, size_t buf_size, float power_limit_w, size_t *out_len)
+{
+    if (power_limit_w <= 0.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return tb_internal_format_power_limit_response(buf, buf_size,
+                                                   power_limit_w, out_len);
+}
+
+/**********************
+ *   STATIC FUNCTIONS
+ **********************/

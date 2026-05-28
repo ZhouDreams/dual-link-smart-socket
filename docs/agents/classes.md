@@ -1699,3 +1699,533 @@ lvgl_dashboard     (依赖: tft_panel, lvgl, esp_event, FreeRTOS)
 ```
 
 各模块通过 esp_event 松耦合：`bl0942 → metering_service → safety_guard` / `lvgl_dashboard` 均通过事件串联，不直接持有对方句柄。
+
+---
+
+## 13. ThingsBoard Client（云平台语义模块）
+
+ThingsBoard Client 是业务服务层的云平台语义模块，负责构建 telemetry JSON、发布属性、解析 RPC 命令。通过 `network_manager` 收发 MQTT，不直接依赖 `wifi_link` 或 `lte_link`。
+
+### 13.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `thingsboard_client_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
+| `tb_client_config_t` | 用户 API | app_controller | 配置结构体 | TB 平台参数 + network_manager 句柄 |
+| `tb_telemetry_input_t` | 用户 API | app_controller | 值对象 | 构建 telemetry JSON 的输入聚合 |
+| `tb_command_type_t` | 用户 API | app_controller | 枚举 | SET_RELAY / GET_POWER_LIMIT / SET_POWER_LIMIT |
+| `tb_command_t` | 用户 API | app_controller | 值对象 | 解析后的下行语义命令 |
+| `tb_command_cb_t` | 用户 API | app_controller | 回调类型 | 语义命令回调 |
+
+### 13.2 `tb_client_config_t` — 初始化配置
+
+**所属层**：业务服务层
+**可见性**：用户 API
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    network_manager_t *net_mgr;          // 网络管理器句柄
+    const char *device_token;            // TB 设备访问令牌
+    bool enable_rpc;                     // 是否启用 RPC 订阅
+    bool enable_attributes;              // 是否启用属性订阅
+    int json_buf_size;                   // JSON 构建缓冲区大小（默认 512）
+} tb_client_config_t;
+```
+
+### 13.3 `tb_telemetry_input_t` — Telemetry 输入
+
+**所属层**：业务服务层
+**可见性**：用户 API
+**OOP 角色**：值对象
+
+```c
+typedef struct {
+    float voltage;                       // 电压 (V)
+    float current;                       // 电流 (A)
+    float power;                         // 有功功率 (W)
+    float total_energy;                  // 累计电能 (Wh)
+    bool relay_on;                       // 继电器状态
+    const char *active_link;             // "wifi" / "lte"
+    safety_guard_level_t safety_level;   // 安全风险等级
+    bool valid;                          // 数据是否有效
+} tb_telemetry_input_t;
+```
+
+### 13.4 `tb_command_t` — 下行命令
+
+**所属层**：业务服务层
+**可见性**：用户 API
+**OOP 角色**：值对象
+
+```c
+typedef enum {
+    TB_COMMAND_SET_RELAY = 0,
+    TB_COMMAND_GET_POWER_LIMIT,
+    TB_COMMAND_SET_POWER_LIMIT,
+} tb_command_type_t;
+
+typedef struct {
+    tb_command_type_t type;
+    int32_t request_id;                  // RPC request id
+    bool relay_on;                       // SET_RELAY 目标状态
+    float power_limit_w;                 // SET_POWER_LIMIT 功率阈值 (W)
+} tb_command_t;
+
+typedef void (*tb_command_cb_t)(const tb_command_t *cmd, void *user_ctx);
+```
+
+### 13.5 `thingsboard_client_t` — 句柄
+
+**所属层**：业务服务层
+**可见性**：用户 API (opaque)
+**OOP 角色**：句柄
+
+**公开方法**（`thingsboard_client.h`）：
+
+```c
+thingsboard_client_t *thingsboard_client_create(const tb_client_config_t *config);
+esp_err_t thingsboard_client_destroy(thingsboard_client_t *me);
+
+esp_err_t thingsboard_client_start(thingsboard_client_t *me);
+esp_err_t thingsboard_client_stop(thingsboard_client_t *me);
+
+// 上行
+esp_err_t thingsboard_client_publish_telemetry(thingsboard_client_t *me,
+                                                const tb_telemetry_input_t *input);
+esp_err_t thingsboard_client_report_relay_state(thingsboard_client_t *me, bool on);
+esp_err_t thingsboard_client_report_power_limit(thingsboard_client_t *me,
+                                                 float power_limit_w);
+esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
+                                                int32_t request_id,
+                                                const char *json, size_t json_len);
+
+// 下行
+esp_err_t thingsboard_client_register_command_cb(thingsboard_client_t *me,
+                                                  tb_command_cb_t cb, void *ctx);
+```
+
+**内部结构**（定义在 `thingsboard_client.c`）：
+
+```c
+struct thingsboard_client {
+    tb_client_config_t config;
+    SemaphoreHandle_t mutex;
+    char *json_buf;
+    int json_buf_size;
+    tb_command_cb_t cmd_cb;
+    void *cmd_ctx;
+    bool started;
+    bool destroying;
+};
+```
+
+### 13.6 TB Topic 约定
+
+```
+telemetry:    v1/devices/me/telemetry
+attributes:   v1/devices/me/attributes
+rpc_request:  v1/devices/me/rpc/request/+
+rpc_response: v1/devices/me/rpc/response/{request_id}
+```
+
+### 13.7 数据流
+
+```
+上行:
+app_controller
+    │  tb_telemetry_input_t
+    ▼
+thingsboard_client_publish_telemetry()
+    │  构建 JSON: {"voltage":220.1,"current":1.5,"power":330,...}
+    ▼
+network_manager_publish(net_mgr, &req)  →  WiFi 或 LTE  →  ThingsBoard
+
+下行:
+ThingsBoard  →  WiFi/LTE  →  network_manager rx_cb
+    │  network_rx_data_t {topic, data}
+    ▼
+thingsboard_client on_mqtt_data()
+    │  匹配 RPC topic pattern
+    │  解析 JSON → tb_command_t
+    ▼
+cmd_cb(cmd, ctx)  →  app_controller  →  relay_set() / safety_guard_set_thresholds()
+```
+
+### 13.8 关键设计决策
+
+- `start()` 通过 `network_manager_subscribe()` 注册 RPC 和属性 topic；通过 `network_manager_register_rx_cb()` 注册下行回调
+- `publish_telemetry()` 内部构建 JSON 后调用 `network_manager_publish()`，不直接依赖 `wifi_link` 或 `lte_link`
+- `report_relay_state()` 和 `report_power_limit()` 是快捷方法，内部构建 attribute JSON 并 publish
+- RPC 响应 topic 格式为 `v1/devices/me/rpc/response/{request_id}`
+- 不依赖旧项目的 `feature_engineering_t`、`load_class_t`、`risk_score`、`risk_model`——纯业务语义
+- `json_buf` 是预分配缓冲区，telemetry JSON 在栈上构建后通过 `network_manager_publish` 发出
+
+---
+
+## 14. LTE Link（LTE 链路子类）
+
+LTE Link 是网络抽象层的 `network_link_t` 具体子类，封装自研 esp-lwlte 组件，实现 LTE + MQTT 的完整链路。通过 `lwlte_t` 门面 API 操作 Air780EP 模块，通过 `network_link_ops_t` 虚函数表接入 `network_manager` 的多态体系。
+
+### 14.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `lte_link_config_t` | 用户 API | app_controller | 配置结构体 | UART/GPIO + APN + MQTT 参数 |
+| `lte_link_t` | 内部 | lte_link 自身 | 子类结构体 | 继承 `network_link_t`，内含 `lwlte_t *` |
+
+`network_link_ops_t` 和 `network_link_t` 已在 Batch 3 第 6 节定义。
+
+### 14.2 `lte_link_config_t` — 初始化配置
+
+**所属层**：网络抽象层
+**可见性**：用户 API — app_controller 从 board_pinmap 读取后填入
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    // UART
+    uart_port_t uart_num;
+    gpio_num_t tx_gpio;
+    gpio_num_t rx_gpio;
+    int baud_rate;
+    // LTE Module GPIO
+    gpio_num_t en_gpio;
+    // Network
+    const char *apn;
+    bool auto_connect;
+    // MQTT
+    bool mqtt_enabled;
+    const char *mqtt_broker_host;
+    uint16_t mqtt_broker_port;
+    const char *mqtt_client_id;
+    const char *mqtt_username;
+    const char *mqtt_password;
+    uint16_t mqtt_keepalive_s;
+    bool mqtt_clean_session;
+    // Tuning (0 = use esp-lwlte defaults)
+    uint32_t init_ready_timeout_ms;
+    uint32_t net_activate_timeout_ms;
+    int max_subscriptions;
+    int max_topic_len;
+} lte_link_config_t;
+```
+
+### 14.3 `lte_link_t` — 子类内部结构
+
+**所属层**：网络抽象层
+**可见性**：内部 — 定义在 `lte_link.c`
+**OOP 角色**：具体子类 — `network_link_t` 必须是第一个字段
+
+```c
+typedef struct {
+    char topic[LTE_LINK_MAX_TOPIC_LEN];
+    network_mqtt_qos_t qos;
+    bool in_use;
+} lte_link_sub_entry_t;
+
+struct lte_link {
+    network_link_t base;
+    lte_link_config_t config;
+    lwlte_t *lwlte;
+    // 订阅表
+    lte_link_sub_entry_t *sub_table;
+    int sub_table_size;
+    // 线程安全
+    SemaphoreHandle_t mutex;
+    // 下行回调
+    network_rx_cb_t rx_cb;
+    void *rx_ctx;
+    // 状态缓存
+    network_link_status_t cached_status;
+    // 状态
+    bool started;
+    bool destroying;
+};
+```
+
+### 14.4 工厂函数和 ops 实现
+
+**工厂函数**（`lte_link.h`）：
+
+```c
+network_link_t *lte_link_create(const lte_link_config_t *config);
+```
+
+`lte_link_create()` 内部调用 `lwlte_air780ep_init()`，**阻塞**直到 esp-lwlte ready（AT Engine + Modem + Core 初始化完成），然后返回 `network_link_t *`。
+
+**ops 实现映射**：
+
+| ops 方法 | 实现要点 |
+|----------|----------|
+| `destroy` | 停止链路 → `lwlte_destroy(lwlte)` → 释放 sub_table → 释放自身 |
+| `start` | `lwlte_connect(lwlte)`；若 `mqtt_enabled` → `lwlte_mqtt_start(lwlte)` |
+| `stop` | 停止 MQTT → 断开网络 → 保留 lwlte 句柄可重 start |
+| `get_status` | 从 `lwlte_get_state()` / `lwlte_mqtt_get_state()` 映射到 `network_link_status_t` |
+| `publish` | `lwlte_mqtt_publish(lwlte, topic, payload, len, qos, retain)` |
+| `subscribe` | 写入自身订阅表 → `lwlte_mqtt_subscribe(lwlte, topic, qos)` |
+| `unsubscribe` | 从订阅表移除 → `lwlte_mqtt_unsubscribe(lwlte, topic)` |
+| `register_rx_cb` | 保存回调 → lwlte 事件 `LWLTE_EVENT_MQTT_DATA` 时调用 |
+
+### 14.5 状态映射
+
+```
+lwlte_state_t              → network_link_status_t.state
+─────────────────────────────────────────────────────────
+STOPPED                    → IDLE
+STARTING                   → STARTING
+READY / NET_ACTIVATING     → CONNECTING
+ONLINE + MQTT_STOPPED      → DEGRADED
+ONLINE + MQTT_CONNECTED    → READY
+ERROR                      → ERROR
+```
+
+### 14.6 lwlte 事件处理流
+
+```
+lwlte event callback (在 esp-lwlte 内部任务上下文)
+    │  LWLTE_EVENT_NET_ONLINE    → 更新状态
+    │  LWLTE_EVENT_NET_OFFLINE   → 更新状态 → 尝试重连
+    │  LWLTE_EVENT_MQTT_CONNECTED → 遍历 sub_table 重放订阅
+    │  LWLTE_EVENT_MQTT_DATA     → 构造 network_rx_data_t → 调用 rx_cb
+    │  LWLTE_EVENT_ERROR         → 更新状态为 ERROR
+```
+
+### 14.7 关键设计决策
+
+- `lte_link_create()` 阻塞直到 esp-lwlte 初始化完成（AT Engine + Modem + Core ready），失败返回 NULL
+- `lte_link` 维护自己的订阅表，因为 esp-lwlte 的 MQTT subscribe 不记住订阅意图，重连后需 lte_link 重放
+- 配置中大量 esp-lwlte 调优参数（`at_rx_buf_size`、`modem_event_queue_size` 等）不暴露，内部填 0 使用 esp-lwlte 默认值
+- `auto_connect=true` 时 `create` 即提交联网请求；`false` 时由 `start()` 触发
+- esp-lwlte 通过 `EXTRA_COMPONENT_DIRS` 指向 `/Users/jovisdreams/Projects/esp-lwlte`
+
+---
+
+## 15. App Controller（应用编排层）
+
+App Controller 是应用编排层的唯一模块，持有全部底层模块句柄，负责装配依赖、注册回调、协调启动顺序和业务流程。不创建底层对象——所有模块由 `main.c` 创建后注入。
+
+### 15.1 类总览
+
+| 类 | 可见性 | 被谁使用 | OOP 角色 | 说明 |
+|----|--------|---------|---------|------|
+| `app_controller_t` | 用户 API (opaque) | main.c | 句柄 | struct 定义在 .c |
+| `app_controller_config_t` | 用户 API | main.c | 配置结构体 | 所有模块句柄 + 回调 |
+
+### 15.2 `app_controller_config_t` — 装配配置
+
+**所属层**：应用编排层
+**可见性**：用户 API — main.c 填入所有已创建的模块句柄
+**OOP 角色**：配置结构体
+
+```c
+typedef struct {
+    // 基础设施
+    esp_event_loop_handle_t event_loop;
+    const board_pinmap_t *pinmap;
+    // 驱动层
+    relay_t *relay;
+    button_t *button;
+    bl0942_t *bl0942;
+    tft_panel_t *tft_panel;
+    // 服务层
+    metering_service_t *metering;
+    safety_guard_t *safety;
+    thingsboard_client_t *tb;
+    // 网络层
+    network_manager_t *net_mgr;
+    // 显示层
+    lvgl_dashboard_t *dashboard;
+} app_controller_config_t;
+```
+
+### 15.3 `app_controller_t` — 句柄
+
+**所属层**：应用编排层
+**可见性**：用户 API (opaque)
+**OOP 角色**：句柄
+
+**公开方法**（`app_controller.h`）：
+
+```c
+app_controller_t *app_controller_create(const app_controller_config_t *config);
+esp_err_t app_controller_destroy(app_controller_t *me);
+
+esp_err_t app_controller_start(app_controller_t *me);
+esp_err_t app_controller_stop(app_controller_t *me);
+```
+
+**内部结构**（定义在 `app_controller.c`）：
+
+```c
+struct app_controller {
+    app_controller_config_t cfg;
+    bool started;
+};
+```
+
+### 15.4 `start()` 编排序列
+
+```
+1. 注册按键回调
+   button_register_cb(btn, SINGLE_CLICK, on_button_single_click, relay);
+   button_register_cb(btn, LONG_PRESS_START, on_button_long_press, dashboard);
+
+2. 注册 safety_guard 事件 → 继电器关断
+   esp_event_handler_register(SAFETY_GUARD_EVENT_BASE,
+       SAFETY_GUARD_EVENT_SNAPSHOT, on_safety_snapshot, relay);
+
+3. 注册 metering 事件 → TB telemetry 上报
+   esp_event_handler_register(METERING_EVENT_BASE,
+       METERING_EVENT_SNAPSHOT, on_metering_snapshot, tb);
+
+4. 注册 relay 事件 → TB 状态上报
+   esp_event_handler_register(RELAY_EVENT_BASE,
+       RELAY_EVENT_STATE_CHANGED, on_relay_changed, tb);
+
+5. 注册 TB 命令回调
+   thingsboard_client_register_command_cb(tb, on_tb_command, app);
+
+6. 启动各模块（按依赖顺序）:
+   bl0942_start()
+   metering_service_start()
+   safety_guard_start()
+   network_manager_start()
+   thingsboard_client_start()
+   lvgl_dashboard_start()
+```
+
+### 15.5 核心回调实现
+
+**本地按键 → 继电器**：
+```c
+static void on_button_single_click(button_event_t event, void *ctx) {
+    relay_t *relay = (relay_t *)ctx;
+    relay_toggle(relay, RELAY_SOURCE_LOCAL_BUTTON);
+}
+
+static void on_button_long_press(button_event_t event, void *ctx) {
+    lvgl_dashboard_t *dash = (lvgl_dashboard_t *)ctx;
+    lvgl_dashboard_set_screen_enabled(dash, !currently_enabled);
+}
+```
+
+**安全规则 → 继电器**：
+```c
+static void on_safety_snapshot(void *arg, esp_event_base_t base,
+                                int32_t id, void *data) {
+    safety_guard_snapshot_t *snap = (safety_guard_snapshot_t *)data;
+    relay_t *relay = (relay_t *)arg;
+    if (snap->suggested_action == SAFETY_GUARD_ACTION_RELAY_OFF) {
+        relay_set(relay, RELAY_SOURCE_SAFETY, false);
+    }
+}
+```
+
+**TB 命令 → 继电器/安全阈值**：
+```c
+static void on_tb_command(const tb_command_t *cmd, void *ctx) {
+    app_controller_t *app = (app_controller_t *)ctx;
+    switch (cmd->type) {
+    case TB_COMMAND_SET_RELAY:
+        relay_set(app->cfg.relay, RELAY_SOURCE_CLOUD, cmd->relay_on);
+        thingsboard_client_report_relay_state(app->cfg.tb, cmd->relay_on);
+        break;
+    case TB_COMMAND_GET_POWER_LIMIT: {
+        float threshold = /* 从 safety_guard 读取当前阈值 */;
+        thingsboard_client_send_rpc_response(app->cfg.tb,
+            cmd->request_id, response_json, len);
+        break;
+    }
+    case TB_COMMAND_SET_POWER_LIMIT:
+        safety_guard_set_thresholds(app->cfg.safety, 0, cmd->power_limit_w);
+        break;
+    }
+}
+```
+
+### 15.6 `main.c` 装配示例
+
+```c
+void app_main(void) {
+    esp_event_loop_create_default();
+    const board_pinmap_t *pm = board_pinmap_get();
+
+    // 驱动层
+    relay_t *relay = relay_create(&(relay_config_t){
+        .ctrl_gpio = pm->relay_ctrl_gpio,
+        .active_level = (relay_active_level_t)pm->relay_active_level,
+    });
+    button_t *btn = button_create(&(button_config_t){
+        .input_gpio = pm->button_gpio,
+        .active_level = (button_active_level_t)pm->button_active_level,
+    });
+    bl0942_t *bl = bl0942_create(&(bl0942_config_t){...});
+    tft_panel_t *tft = tft_panel_create(&(tft_panel_config_t){...});
+
+    // 服务层
+    metering_service_t *ms = metering_service_create(&(metering_config_t){...});
+    safety_guard_t *sg = safety_guard_create(&(safety_guard_config_t){...});
+
+    // 网络层
+    network_link_t *wifi = wifi_link_create(&wifi_cfg);
+    network_link_t *lte = lte_link_create(&lte_cfg);
+    network_manager_t *nm = network_manager_create(&(network_manager_config_t){
+        .primary = wifi, .backup = lte,
+        .preferred_primary = NETWORK_LINK_TYPE_WIFI,
+        ...
+    });
+
+    // 云端
+    thingsboard_client_t *tb = thingsboard_client_create(&(tb_client_config_t){
+        .net_mgr = nm, .device_token = "...", ...
+    });
+
+    // 显示
+    lvgl_dashboard_t *dash = lvgl_dashboard_create(&(lvgl_dashboard_config_t){
+        .panel = tft, ...
+    });
+
+    // 装配并启动
+    app_controller_t *app = app_controller_create(&(app_controller_config_t){
+        .event_loop = NULL,  // use default
+        .pinmap = pm,
+        .relay = relay, .button = btn, .bl0942 = bl, .tft_panel = tft,
+        .metering = ms, .safety = sg, .tb = tb,
+        .net_mgr = nm, .dashboard = dash,
+    });
+    app_controller_start(app);
+}
+```
+
+### 15.7 关键设计决策
+
+- `app_controller` 不创建任何底层模块，只接收句柄并编排
+- `start()` 按依赖顺序注册所有回调 + 启动子模块
+- 自身不在 esp_event 上发事件，只做订阅和协调
+- 每条数据流（按键→继电器、安全→继电器、电参量→TB、TB命令→继电器）都在 `app_controller.c` 中以回调函数实现，集中可见
+- `main.c` 是唯一的对象创建点，所有装配关系一目了然
+
+---
+
+## 全部模块依赖关系（Batch 1–6）
+
+```text
+board_pinmap       (无依赖)
+network_types.h    (无依赖，纯头文件)
+relay              (依赖: driver/gpio.h, FreeRTOS, esp_event)
+button             (依赖: espressif/button, driver/gpio.h)
+bl0942             (依赖: driver/uart.h, driver/gpio.h, FreeRTOS, esp_event)
+network_link       (依赖: network_types.h, esp_err.h)
+metering_service   (依赖: bl0942 事件类型, esp_event, FreeRTOS)
+wifi_link          (依赖: network_link, network_types.h, esp_wifi, esp_netif, esp_mqtt, FreeRTOS)
+network_manager    (依赖: network_link, network_types.h, FreeRTOS)
+safety_guard       (依赖: metering_service 事件类型, esp_event, FreeRTOS)
+tft_panel          (依赖: driver/spi_master.h, driver/gpio.h)
+lvgl_dashboard     (依赖: tft_panel, lvgl, esp_event, FreeRTOS)
+thingsboard_client (依赖: network_manager, network_types.h, FreeRTOS, esp_event)
+lte_link           (依赖: network_link, network_types.h, esp-lwlte, FreeRTOS)
+app_controller     (依赖: 全部模块公共头文件, esp_event, FreeRTOS)
+```
+
+全部 15 个模块定义完毕。`thingsboard_client` 和 `lte_link` 通过 `network_manager` 间接使用 MQTT，不直接依赖 `wifi_link` 或彼此。`app_controller` 是唯一知道所有模块存在的模块。

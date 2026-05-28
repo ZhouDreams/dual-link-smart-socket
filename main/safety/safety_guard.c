@@ -339,6 +339,32 @@ esp_err_t safety_guard_set_thresholds(safety_guard_t *me,
     return ESP_OK;
 }
 
+esp_err_t safety_guard_get_thresholds(safety_guard_t *me,
+                                      float *out_overcurrent_a,
+                                      float *out_overpower_w)
+{
+    ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "guard is null");
+    ESP_RETURN_ON_FALSE(out_overcurrent_a != NULL || out_overpower_w != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "no output requested");
+    ESP_RETURN_ON_FALSE(me->initialized, ESP_ERR_INVALID_STATE, TAG,
+                        "guard is not initialized");
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+
+    if (out_overcurrent_a != NULL) {
+        *out_overcurrent_a = me->config.overcurrent_threshold_a;
+    }
+    if (out_overpower_w != NULL) {
+        *out_overpower_w = me->config.overpower_threshold_w;
+    }
+
+    (void)xSemaphoreGive(me->mutex);
+    return ESP_OK;
+}
+
 /**********************
  *   STATIC FUNCTIONS
  **********************/

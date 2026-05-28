@@ -13,6 +13,7 @@
 #include "button.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "button_iot_adapter.h"
@@ -20,12 +21,14 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 /*********************
  *      DEFINES
  *********************/
 
 #define TAG "button"
+#define BUTTON_CALLBACK_DRAIN_POLL_MS (10U)
 
 /**********************
  *      TYPEDEFS
@@ -37,6 +40,7 @@ struct button {
     button_iot_handle_t iot_button_handle;
     button_event_cb_t callbacks[BUTTON_EVENT_MAX];
     void *user_ctxs[BUTTON_EVENT_MAX];
+    uint32_t active_callbacks[BUTTON_EVENT_MAX];
     SemaphoreHandle_t mutex;
     bool initialized;
 };
@@ -69,6 +73,28 @@ static void button_dispatch(button_t *me, button_event_t event);
  * @param[in] handle 底层按键句柄； Underlying button handle
  */
 static void button_unregister_iot_callbacks(button_iot_handle_t handle);
+
+/**
+ * @brief 等待指定事件回调退出
+ * @details Wait for one event callback to drain
+ * @param[in] me 按键句柄； Button handle
+ * @param[in] event 按键事件； Button event
+ * @return
+ *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_TIMEOUT: 获取互斥锁超时； Mutex timeout
+ */
+static esp_err_t button_wait_event_callbacks_drained(button_t *me,
+                                                     button_event_t event);
+
+/**
+ * @brief 等待所有事件回调退出
+ * @details Wait for all event callbacks to drain
+ * @param[in] me 按键句柄； Button handle
+ * @return
+ *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_TIMEOUT: 获取互斥锁超时； Mutex timeout
+ */
+static esp_err_t button_wait_all_callbacks_drained(button_t *me);
 
 /**
  * @brief 处理单击事件
@@ -208,10 +234,8 @@ esp_err_t button_destroy(button_t *me)
         return ESP_OK;
     }
 
-    if (me->mutex != NULL) {
-        if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-            return ESP_ERR_TIMEOUT;
-        }
+    if (me->mutex != NULL && xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
     me->initialized = false;
@@ -223,6 +247,12 @@ esp_err_t button_destroy(button_t *me)
 
     if (me->mutex != NULL) {
         (void)xSemaphoreGive(me->mutex);
+    }
+
+    button_unregister_iot_callbacks(me->iot_button_handle);
+    ret = button_wait_all_callbacks_drained(me);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     ret = button_iot_delete(me->iot_button_handle);
@@ -258,6 +288,11 @@ esp_err_t button_register_cb(button_t *me, button_event_t event,
     me->user_ctxs[event] = (cb != NULL) ? user_ctx : NULL;
 
     (void)xSemaphoreGive(me->mutex);
+
+    if (cb == NULL) {
+        return button_wait_event_callbacks_drained(me, event);
+    }
+
     return ESP_OK;
 }
 
@@ -294,13 +329,69 @@ static void button_dispatch(button_t *me, button_event_t event)
     if (me->initialized) {
         cb = me->callbacks[event];
         user_ctx = me->user_ctxs[event];
+        if (cb != NULL) {
+            me->active_callbacks[event]++;
+        }
     }
 
     (void)xSemaphoreGive(me->mutex);
 
     if (cb != NULL) {
         cb(event, user_ctx);
+
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+            if (me->active_callbacks[event] > 0U) {
+                me->active_callbacks[event]--;
+            }
+            (void)xSemaphoreGive(me->mutex);
+        }
     }
+}
+
+static esp_err_t button_wait_event_callbacks_drained(button_t *me,
+                                                     button_event_t event)
+{
+    bool drained = false;
+
+    while (!drained) {
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        drained = me->active_callbacks[event] == 0U;
+        (void)xSemaphoreGive(me->mutex);
+
+        if (!drained) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_CALLBACK_DRAIN_POLL_MS));
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t button_wait_all_callbacks_drained(button_t *me)
+{
+    bool drained = false;
+
+    while (!drained) {
+        drained = true;
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        for (button_event_t event = BUTTON_EVENT_SINGLE_CLICK;
+             event < BUTTON_EVENT_MAX; ++event) {
+            if (me->active_callbacks[event] != 0U) {
+                drained = false;
+                break;
+            }
+        }
+        (void)xSemaphoreGive(me->mutex);
+
+        if (!drained) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_CALLBACK_DRAIN_POLL_MS));
+        }
+    }
+
+    return ESP_OK;
 }
 
 static void button_unregister_iot_callbacks(button_iot_handle_t handle)

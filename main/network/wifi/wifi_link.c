@@ -26,6 +26,7 @@
 #include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mqtt_client.h"
 #include "network_link_priv.h"
 
@@ -40,6 +41,7 @@
 #define WIFI_LINK_DEFAULT_KEEPALIVE_S       (60)
 #define WIFI_LINK_MAX_SSID_LEN              (32)
 #define WIFI_LINK_MAX_PASSWORD_LEN          (64)
+#define WIFI_LINK_RUNTIME_DRAIN_POLL_MS     (10)
 
 /**********************
  *      TYPEDEFS
@@ -262,6 +264,14 @@ static bool wifi_link_begin_runtime_action_locked(wifi_link_t *me);
  * @param[in,out] me Wi-Fi link object
  */
 static void wifi_link_end_runtime_action(wifi_link_t *me);
+
+/**
+ * @brief Wait for runtime actions to drain
+ * @details Wait for runtime actions to drain
+ * @param[in,out] me Wi-Fi link object
+ * @return ESP-IDF error code
+ */
+static esp_err_t wifi_link_wait_runtime_actions_drained(wifi_link_t *me);
 
 /**
  * @brief Begin serialized MQTT broker operation
@@ -913,9 +923,14 @@ static esp_err_t wifi_link_register_rx_cb_impl(network_link_t *base,
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
     me->rx_cb = cb;
-    me->rx_ctx = ctx;
+    me->rx_ctx = (cb != NULL) ? ctx : NULL;
     (void)xSemaphoreGive(me->mutex);
-    return ESP_OK;
+
+    if (cb != NULL) {
+        return ESP_OK;
+    }
+
+    return wifi_link_wait_runtime_actions_drained(me);
 }
 
 static esp_err_t wifi_link_cleanup_resources(wifi_link_t *me)
@@ -1220,6 +1235,28 @@ static void wifi_link_end_runtime_action(wifi_link_t *me)
         me->runtime_action_count--;
     }
     (void)xSemaphoreGive(me->mutex);
+}
+
+static esp_err_t wifi_link_wait_runtime_actions_drained(wifi_link_t *me)
+{
+    ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+
+    while (true) {
+        int runtime_action_count = 0;
+
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        runtime_action_count = me->runtime_action_count;
+        (void)xSemaphoreGive(me->mutex);
+
+        if (runtime_action_count == 0) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(WIFI_LINK_RUNTIME_DRAIN_POLL_MS));
+    }
 }
 
 static bool wifi_link_begin_mqtt_op_locked(wifi_link_t *me)
