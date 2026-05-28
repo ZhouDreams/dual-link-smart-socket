@@ -20,7 +20,10 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
+#if CONFIG_SMART_SOCKET_LTE_ENABLED
 #include "lte_link.h"
+#endif
 #include "lvgl_dashboard.h"
 #include "metering_service.h"
 #include "network_manager.h"
@@ -33,19 +36,6 @@
 /*********************
  *      DEFINES
  *********************/
-
-#define SMART_SOCKET_WIFI_SSID        "SmartSocketWiFi"
-#define SMART_SOCKET_WIFI_PASSWORD    "replace_with_wifi_password"
-#define SMART_SOCKET_TB_HOST          "thingsboard.cloud"
-#define SMART_SOCKET_TB_PORT          (1883)
-#define SMART_SOCKET_TB_CLIENT_ID     "smart_socket_001"
-#define SMART_SOCKET_TB_TOKEN         "replace_with_access_token"
-#define SMART_SOCKET_LTE_APN          "cmnet"
-
-#define SMART_SOCKET_BL0942_UART      UART_NUM_1
-#define SMART_SOCKET_LTE_UART         UART_NUM_2
-#define SMART_SOCKET_PANEL_WIDTH      (172)
-#define SMART_SOCKET_PANEL_HEIGHT     (320)
 
 /**********************
  *      TYPEDEFS
@@ -105,7 +95,7 @@ void app_main(void)
         .active_level = (button_active_level_t)pm->button_active_level,
     });
     bl0942_t *bl0942 = bl0942_create(&(bl0942_config_t) {
-        .uart_num = SMART_SOCKET_BL0942_UART,
+        .uart_num = CONFIG_SMART_SOCKET_BL0942_UART_NUM,
         .en_gpio = pm->bl0942_en_gpio,
         .tx_gpio = pm->bl0942_tx_gpio,
         .rx_gpio = pm->bl0942_rx_gpio,
@@ -133,8 +123,8 @@ void app_main(void)
         .cs_gpio = pm->tft_cs_gpio,
         .rst_gpio = pm->tft_rst_gpio,
         .bl_gpio = pm->tft_bl_gpio,
-        .panel_width = SMART_SOCKET_PANEL_WIDTH,
-        .panel_height = SMART_SOCKET_PANEL_HEIGHT,
+        .panel_width = CONFIG_SMART_SOCKET_PANEL_WIDTH,
+        .panel_height = CONFIG_SMART_SOCKET_PANEL_HEIGHT,
     });
     if ((relay == NULL) || (button == NULL) || (bl0942 == NULL) ||
         (metering == NULL) || (safety == NULL) || (tft == NULL)) {
@@ -143,56 +133,69 @@ void app_main(void)
     }
 
     network_link_t *wifi = wifi_link_create(&(wifi_link_config_t) {
-        .ssid = SMART_SOCKET_WIFI_SSID,
-        .password = SMART_SOCKET_WIFI_PASSWORD,
-        .mqtt_broker_host = SMART_SOCKET_TB_HOST,
-        .mqtt_broker_port = SMART_SOCKET_TB_PORT,
-        .mqtt_client_id = SMART_SOCKET_TB_CLIENT_ID,
-        .mqtt_username = SMART_SOCKET_TB_TOKEN,
+        .ssid = CONFIG_SMART_SOCKET_WIFI_SSID,
+        .password = CONFIG_SMART_SOCKET_WIFI_PASSWORD,
+        .mqtt_broker_host = CONFIG_SMART_SOCKET_TB_HOST,
+        .mqtt_broker_port = CONFIG_SMART_SOCKET_TB_PORT,
+        .mqtt_client_id = CONFIG_SMART_SOCKET_TB_CLIENT_ID,
+        .mqtt_username = CONFIG_SMART_SOCKET_TB_TOKEN,
         .mqtt_password = NULL,
-        .mqtt_keepalive_s = 60,
-        .mqtt_clean_session = true,
-        .mqtt_use_tls = false,
-        .max_subscriptions = 8,
-        .max_topic_len = 128,
+        .mqtt_keepalive_s = CONFIG_SMART_SOCKET_WIFI_MQTT_KEEPALIVE_S,
+        .mqtt_clean_session = CONFIG_SMART_SOCKET_WIFI_MQTT_CLEAN_SESSION,
+        .mqtt_use_tls =
+#ifdef CONFIG_SMART_SOCKET_WIFI_MQTT_USE_TLS
+            true
+#else
+            false
+#endif
+        ,
+        .max_subscriptions = CONFIG_SMART_SOCKET_WIFI_MAX_SUBSCRIPTIONS,
+        .max_topic_len = CONFIG_SMART_SOCKET_WIFI_MAX_TOPIC_LEN,
     });
-    network_link_t *lte = lte_link_create(&(lte_link_config_t) {
-        .uart_num = SMART_SOCKET_LTE_UART,
+    network_link_t *lte = NULL;
+#if CONFIG_SMART_SOCKET_LTE_ENABLED
+    lte = lte_link_create(&(lte_link_config_t) {
+        .uart_num = CONFIG_SMART_SOCKET_LTE_UART_NUM,
         .tx_gpio = pm->lte_tx_gpio,
         .rx_gpio = pm->lte_rx_gpio,
         .baud_rate = 0,
         .en_gpio = pm->lte_en_gpio,
-        .apn = SMART_SOCKET_LTE_APN,
+        .apn = CONFIG_SMART_SOCKET_LTE_APN,
         .auto_connect = false,
         .mqtt_enabled = true,
-        .mqtt_broker_host = SMART_SOCKET_TB_HOST,
-        .mqtt_broker_port = SMART_SOCKET_TB_PORT,
-        .mqtt_client_id = SMART_SOCKET_TB_CLIENT_ID,
-        .mqtt_username = SMART_SOCKET_TB_TOKEN,
+        .mqtt_broker_host = CONFIG_SMART_SOCKET_TB_HOST,
+        .mqtt_broker_port = CONFIG_SMART_SOCKET_TB_PORT,
+        .mqtt_client_id = CONFIG_SMART_SOCKET_TB_CLIENT_ID,
+        .mqtt_username = CONFIG_SMART_SOCKET_TB_TOKEN,
         .mqtt_password = NULL,
-        .mqtt_keepalive_s = 60,
-        .mqtt_clean_session = true,
-        .init_ready_timeout_ms = 60000,
-        .net_activate_timeout_ms = 120000,
-        .max_subscriptions = 8,
-        .max_topic_len = 128,
+        .mqtt_keepalive_s = CONFIG_SMART_SOCKET_LTE_MQTT_KEEPALIVE_S,
+        .mqtt_clean_session = CONFIG_SMART_SOCKET_LTE_MQTT_CLEAN_SESSION,
+        .init_ready_timeout_ms = CONFIG_SMART_SOCKET_LTE_INIT_READY_TIMEOUT_MS,
+        .net_activate_timeout_ms = CONFIG_SMART_SOCKET_LTE_NET_ACTIVATE_TIMEOUT_MS,
+        .max_subscriptions = CONFIG_SMART_SOCKET_LTE_MAX_SUBSCRIPTIONS,
+        .max_topic_len = CONFIG_SMART_SOCKET_LTE_MAX_TOPIC_LEN,
     });
+#endif
     network_manager_t *net_mgr = network_manager_create(&(network_manager_config_t) {
         .primary = wifi,
         .backup = lte,
         .preferred_primary = NETWORK_LINK_TYPE_WIFI,
-        .failover_recheck_ms = 5000,
-        .failback_delay_ms = 30000,
-        .max_subscriptions = 8,
+        .failover_recheck_ms = CONFIG_SMART_SOCKET_FAILOVER_RECHECK_MS,
+        .failback_delay_ms = CONFIG_SMART_SOCKET_FAILBACK_DELAY_MS,
+        .max_subscriptions = CONFIG_SMART_SOCKET_NET_MGR_MAX_SUBSCRIPTIONS,
     });
     thingsboard_client_t *tb = thingsboard_client_create(&(tb_client_config_t) {
         .net_mgr = net_mgr,
-        .device_token = SMART_SOCKET_TB_TOKEN,
-        .enable_rpc = true,
-        .enable_attributes = true,
-        .json_buf_size = 512,
+        .device_token = CONFIG_SMART_SOCKET_TB_TOKEN,
+        .enable_rpc = CONFIG_SMART_SOCKET_TB_ENABLE_RPC,
+        .enable_attributes = CONFIG_SMART_SOCKET_TB_ENABLE_ATTRIBUTES,
+        .json_buf_size = CONFIG_SMART_SOCKET_TB_JSON_BUF_SIZE,
     });
-    if ((wifi == NULL) || (lte == NULL) || (net_mgr == NULL) || (tb == NULL)) {
+    if ((wifi == NULL) || (net_mgr == NULL) || (tb == NULL)
+#if CONFIG_SMART_SOCKET_LTE_ENABLED
+        || (lte == NULL)
+#endif
+    ) {
         ESP_LOGE(TAG, "create network/cloud module failed");
         smart_socket_idle_forever();
     }

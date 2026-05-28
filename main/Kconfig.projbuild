@@ -1,0 +1,138 @@
+menu "Smart Socket"
+
+    menu "Wi-Fi 配置"
+        config SMART_SOCKET_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "622"
+
+        config SMART_SOCKET_WIFI_PASSWORD
+            string "Wi-Fi 密码"
+            default "replace_with_wifi_password"
+
+        config SMART_SOCKET_WIFI_MQTT_KEEPALIVE_S
+            int "MQTT 保活间隔（秒）"
+            default 60
+
+        config SMART_SOCKET_WIFI_MQTT_CLEAN_SESSION
+            bool "MQTT Clean Session"
+            default y
+
+        config SMART_SOCKET_WIFI_MQTT_USE_TLS
+            bool "MQTT 启用 TLS"
+            default y
+
+        config SMART_SOCKET_WIFI_MAX_SUBSCRIPTIONS
+            int "最大订阅数"
+            default 8
+
+        config SMART_SOCKET_WIFI_MAX_TOPIC_LEN
+            int "最大主题长度"
+            default 128
+    endmenu
+
+    config SMART_SOCKET_LTE_ENABLED
+        bool "启用 LTE 备用链路"
+        default n
+        help
+            启用后，设备将在 Wi-Fi 不可用时自动切换到 LTE 备用链路。
+            禁用后，设备仅使用 Wi-Fi 连接，network_manager 以单链路模式运行。
+
+            When enabled, the device automatically fails over to the LTE backup
+            link when Wi-Fi is unavailable. When disabled, the device operates
+            in Wi-Fi-only mode; network_manager runs with backup set to NULL.
+
+    menu "LTE 配置"
+        depends on SMART_SOCKET_LTE_ENABLED
+
+        config SMART_SOCKET_LTE_APN
+            string "APN 接入点名称"
+            default ""
+
+        config SMART_SOCKET_LTE_UART_NUM
+            int "LTE UART 端口号"
+            default 2
+
+        config SMART_SOCKET_LTE_MQTT_KEEPALIVE_S
+            int "MQTT 保活间隔（秒）"
+            default 60
+
+        config SMART_SOCKET_LTE_MQTT_CLEAN_SESSION
+            bool "MQTT Clean Session"
+            default y
+
+        config SMART_SOCKET_LTE_INIT_READY_TIMEOUT_MS
+            int "模块就绪超时（毫秒）"
+            default 60000
+
+        config SMART_SOCKET_LTE_NET_ACTIVATE_TIMEOUT_MS
+            int "网络激活超时（毫秒）"
+            default 120000
+
+        config SMART_SOCKET_LTE_MAX_SUBSCRIPTIONS
+            int "最大订阅数"
+            default 8
+
+        config SMART_SOCKET_LTE_MAX_TOPIC_LEN
+            int "最大主题长度"
+            default 128
+    endmenu
+
+    menu "ThingsBoard 配置"
+        config SMART_SOCKET_TB_HOST
+            string "ThingsBoard 服务器地址"
+            default "admin.jovisdreams.site"
+
+        config SMART_SOCKET_TB_PORT
+            int "ThingsBoard MQTT 端口"
+            default 1883
+
+        config SMART_SOCKET_TB_CLIENT_ID
+            string "MQTT 客户端 ID"
+            default "SmartSocket"
+
+        config SMART_SOCKET_TB_TOKEN
+            string "设备访问令牌"
+            default "SmartSocket"
+
+        config SMART_SOCKET_TB_ENABLE_RPC
+            bool "启用 RPC"
+            default y
+
+        config SMART_SOCKET_TB_ENABLE_ATTRIBUTES
+            bool "启用属性"
+            default y
+
+        config SMART_SOCKET_TB_JSON_BUF_SIZE
+            int "JSON 缓冲区大小（字节）"
+            default 512
+    endmenu
+
+    menu "硬件配置"
+        config SMART_SOCKET_BL0942_UART_NUM
+            int "BL0942 UART 端口号"
+            default 1
+
+        config SMART_SOCKET_PANEL_WIDTH
+            int "显示屏宽度（像素）"
+            default 172
+
+        config SMART_SOCKET_PANEL_HEIGHT
+            int "显示屏高度（像素）"
+            default 320
+    endmenu
+
+    menu "网络管理器配置"
+        config SMART_SOCKET_FAILOVER_RECHECK_MS
+            int "故障切换重检周期（毫秒）"
+            default 5000
+
+        config SMART_SOCKET_FAILBACK_DELAY_MS
+            int "主链路恢复回切延迟（毫秒）"
+            default 30000
+
+        config SMART_SOCKET_NET_MGR_MAX_SUBSCRIPTIONS
+            int "订阅意图表容量"
+            default 8
+    endmenu
+
+endmenu
