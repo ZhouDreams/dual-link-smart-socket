@@ -439,7 +439,13 @@ esp_err_t network_manager_start(network_manager_t *me)
 
     me->active = selected;
     me->failback_since_us = 0ULL;
-    (void)network_link_set_active(selected, true);
+    {
+        esp_err_t engage_ret = network_link_set_active(selected, true);
+        if (engage_ret != ESP_OK) {
+            ESP_LOGW(TAG, "engage selected link failed: %s",
+                     esp_err_to_name(engage_ret));
+        }
+    }
 
     /* Hot-standby: bring the non-selected link up too (best-effort). For LTE
      * this reaches the network-only DEGRADED standby state; MQTT is engaged
@@ -462,6 +468,9 @@ esp_err_t network_manager_start(network_manager_t *me)
     if (ret != ESP_OK) {
         me->active = NULL;
         (void)xSemaphoreGive(me->mutex);
+        if (other != NULL) {
+            (void)network_link_stop(other);
+        }
         (void)network_link_stop(selected);
         return ret;
     }
@@ -1235,10 +1244,22 @@ static void network_manager_switch_active_locked(network_manager_t *me,
 
     /* Engage the new active link (LTE: brings up MQTT -> aims for READY) and
      * disengage the old (LTE: stops MQTT, keeps network -> DEGRADED standby).
-     * Wi-Fi set_active is a no-op (NULL op). */
-    (void)network_link_set_active(link, true);
+     * Wi-Fi set_active is a no-op. */
+    {
+        esp_err_t engage_ret = network_link_set_active(link, true);
+        if (engage_ret != ESP_OK) {
+            ESP_LOGW(TAG, "engage new active link failed: %s",
+                     esp_err_to_name(engage_ret));
+        }
+    }
     if (old != NULL) {
-        (void)network_link_set_active(old, false);
+        {
+            esp_err_t engage_ret = network_link_set_active(old, false);
+            if (engage_ret != ESP_OK) {
+                ESP_LOGW(TAG, "disengage old active link failed: %s",
+                         esp_err_to_name(engage_ret));
+            }
+        }
     }
 
     ret = network_manager_replay_subscriptions_locked(me, link);
