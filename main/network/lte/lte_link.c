@@ -64,8 +64,6 @@ typedef struct lte_link {
     int active_rx_callbacks;
     esp_event_handler_instance_t net_handler;
     esp_event_handler_instance_t mqtt_handler;
-    network_link_status_t cached_status;
-    bool mqtt_active;
     bool started;
     bool destroying;
 } lte_link_t;
@@ -147,7 +145,6 @@ network_link_t *lte_link_create(const lte_link_config_t *config)
 
     me->base.ops = &lte_link_ops;
     me->base.type = NETWORK_LINK_TYPE_LTE;
-    me->cached_status = NETWORK_LINK_STATUS_IDLE;
     me->mutex = xSemaphoreCreateMutex();
     if (me->mutex == NULL) {
         ESP_LOGE(TAG, "create mutex failed");
@@ -224,8 +221,6 @@ static esp_err_t lte_link_destroy_impl(network_link_t *base)
     }
 
     me->started = false;
-    me->mqtt_active = false;
-    me->cached_status = NETWORK_LINK_STATUS_IDLE;
 
     if (lwlte != NULL) {
         ret = lwlte_destroy(lwlte);
@@ -324,8 +319,6 @@ static esp_err_t lte_link_stop_impl(network_link_t *base)
 
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
         me->started = false;
-        me->mqtt_active = false;
-        me->cached_status = NETWORK_LINK_STATUS_IDLE;
         (void)xSemaphoreGive(me->mutex);
     }
     return ESP_OK;
@@ -476,12 +469,6 @@ static esp_err_t lte_link_set_active_impl(network_link_t *base, bool active)
         }
     }
 
-    if (ret == ESP_OK) {
-        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
-            me->mqtt_active = active;
-            (void)xSemaphoreGive(me->mutex);
-        }
-    }
     return ret;
 }
 
@@ -733,10 +720,6 @@ static esp_err_t lte_link_query_status(lte_link_t *me,
     const network_link_status_t status = lte_link_internal_map_status(
         lte_state, mqtt_state, me->config.mqtt_enabled, query_ok);
 
-    if (me->mutex != NULL && xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
-        me->cached_status = status;
-        (void)xSemaphoreGive(me->mutex);
-    }
     *out = status;
 
     return query_ok ? ESP_OK : ESP_FAIL;
