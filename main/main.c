@@ -159,7 +159,6 @@ void app_main(void)
         .baud_rate = 0,
         .en_gpio = pm->lte_en_gpio,
         .apn = CONFIG_SMART_SOCKET_LTE_APN,
-        .auto_connect = false,
         .mqtt_enabled = true,
         .mqtt_broker_host = CONFIG_SMART_SOCKET_TB_HOST,
         .mqtt_broker_port = CONFIG_SMART_SOCKET_TB_PORT,

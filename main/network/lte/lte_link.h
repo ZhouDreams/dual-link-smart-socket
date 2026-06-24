@@ -41,7 +41,6 @@ typedef struct {
     int baud_rate;                     /**< UART 波特率，<=0 使用默认值； UART baud rate, <=0 uses default */
     gpio_num_t en_gpio;                /**< 模组 EN GPIO，GPIO_NUM_NC 表示不控制； Module EN GPIO, GPIO_NUM_NC disables control */
     const char *apn;                   /**< APN 字符串，可为 NULL； APN string, nullable */
-    bool auto_connect;                 /**< 初始化后自动联网标志； Auto-connect after init flag */
     bool mqtt_enabled;                 /**< MQTT 启用标志； MQTT enable flag */
     const char *mqtt_broker_host;      /**< MQTT 服务器主机； MQTT broker host */
     uint16_t mqtt_broker_port;         /**< MQTT 服务器端口； MQTT broker port */
