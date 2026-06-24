@@ -40,6 +40,7 @@ typedef struct {
     esp_err_t (*unsubscribe)(network_link_t *me, const char *topic);
     esp_err_t (*register_rx_cb)(network_link_t *me, network_rx_cb_t cb,
                                 void *ctx);
+    esp_err_t (*set_active)(network_link_t *me, bool active);
 } network_link_ops_t;
 
 /**

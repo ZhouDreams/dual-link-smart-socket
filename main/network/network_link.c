@@ -120,6 +120,15 @@ esp_err_t network_link_register_rx_cb(network_link_t *me,
     return me->ops->register_rx_cb(me, cb, ctx);
 }
 
+esp_err_t network_link_set_active(network_link_t *me, bool active)
+{
+    ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
+    if (me->ops == NULL || me->ops->set_active == NULL) {
+        return ESP_OK;  /* optional op: not implemented -> no-op */
+    }
+    return me->ops->set_active(me, active);
+}
+
 network_link_type_t network_link_get_type(const network_link_t *me)
 {
     if (me == NULL) {

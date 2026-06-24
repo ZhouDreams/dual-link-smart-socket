@@ -135,6 +135,18 @@ esp_err_t network_link_register_rx_cb(network_link_t *me,
                                       network_rx_cb_t cb, void *ctx);
 
 /**
+ * @brief 设置链路上岗/卸岗状态
+ * @details Set link active/inactive role
+ * @note 选填方法：子类未实现（ops->set_active 为 NULL）时返回 ESP_OK，按 no-op 处理。
+ * @param[in] me 网络链路句柄； Network link handle
+ * @param[in] active true=上岗（冲向 READY），false=卸岗（退回值守态）； true=engage, false=disengage
+ * @return
+ *         - ESP_OK: 成功或子类未实现（no-op）； Success or not implemented (no-op)
+ *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ */
+esp_err_t network_link_set_active(network_link_t *me, bool active);
+
+/**
  * @brief 获取网络链路类型
  * @details Get network link type
  * @param[in] me 网络链路句柄； Network link handle
