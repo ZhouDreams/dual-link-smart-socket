@@ -315,6 +315,7 @@ docs/
     ├── oop-design.md
     ├── build-and-debug.md
     ├── err.md
+    ├── review-checklist.md
     └── serial_monitor.py
 ```
 
@@ -333,6 +334,7 @@ AI 编码助手和开发会话的长期上下文目录。
 | `oop-design.md` | C 语言 OOP 设计规则 |
 | `build-and-debug.md` | 构建、烧录、串口调试 |
 | `err.md` | 错误处理、返回值、cleanup 规则 |
+| `review-checklist.md` | 代码 review 流程、检查维度、误报防范、报告模板 |
 | `serial_monitor.py` | 非交互串口监视脚本 |
 
 ---

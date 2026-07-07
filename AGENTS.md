@@ -17,6 +17,7 @@ Smart_Socket is a dual-mode networked smart socket system based on ESP32-S3, fea
 | Coding Style & Templates | [docs/agents/coding-style.md](docs/agents/coding-style.md) |
 | C OOP Design Guidelines | [docs/agents/oop-design.md](docs/agents/oop-design.md) |
 | Error Handling | [docs/agents/err.md](docs/agents/err.md) |
+| Code Review Checklist & Process | [docs/agents/review-checklist.md](docs/agents/review-checklist.md) |
 
 ## File Usage Guide
 
