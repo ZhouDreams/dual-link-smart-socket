@@ -180,16 +180,15 @@ esp_err_t relay_set(relay_t *me, relay_source_t source, bool on)
                                    relay_logical_to_level(me, on));
     if (ret == ESP_OK) {
         me->on = on;
+        if (previous_on != on) {
+            relay_post_state_changed(on, source);
+        }
     }
 
     (void)xSemaphoreGive(me->mutex);
 
     if (ret != ESP_OK) {
         return ret;
-    }
-
-    if (previous_on != on) {
-        relay_post_state_changed(on, source);
     }
 
     return ESP_OK;
@@ -214,6 +213,7 @@ esp_err_t relay_toggle(relay_t *me, relay_source_t source)
                                    relay_logical_to_level(me, new_on));
     if (ret == ESP_OK) {
         me->on = new_on;
+        relay_post_state_changed(new_on, source);
     }
 
     (void)xSemaphoreGive(me->mutex);
@@ -222,7 +222,6 @@ esp_err_t relay_toggle(relay_t *me, relay_source_t source)
         return ret;
     }
 
-    relay_post_state_changed(new_on, source);
     return ESP_OK;
 }
 

@@ -46,6 +46,23 @@ mkdir -p "${BUILD_DIR}"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/metering" \
+    -I"${ROOT_DIR}/main/bl0942" \
+    "${ROOT_DIR}/test/host/test_metering_service_event_flow.c" \
+    -o "${BUILD_DIR}/test_metering_service_event_flow"
+
+"${BUILD_DIR}/test_metering_service_event_flow"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/relay" \
+    "${ROOT_DIR}/test/host/test_relay_event_order.c" \
+    -o "${BUILD_DIR}/test_relay_event_order"
+
+"${BUILD_DIR}/test_relay_event_order"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/app" \
     -I"${ROOT_DIR}/main/thingsboard" \
     "${ROOT_DIR}/main/thingsboard/thingsboard_client_internal.c" \

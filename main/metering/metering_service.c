@@ -142,8 +142,11 @@ static void metering_on_bl0942_fault(void *arg, esp_event_base_t base,
  * @brief 发布电参量快照事件
  * @details Post metering snapshot event
  * @param[in] snapshot 快照数据
+ * @return
+ *         - ESP_OK: 发布成功； Posted successfully
+ *         - 其他: 发布失败； Post failed
  */
-static void metering_post_snapshot(const metering_snapshot_t *snapshot);
+static esp_err_t metering_post_snapshot(const metering_snapshot_t *snapshot);
 
 /**********************
  *  STATIC VARIABLES
@@ -708,20 +711,47 @@ static void metering_on_bl0942_measurement(void *arg, esp_event_base_t base,
                  (double)snapshot.energy_delta,
                  (double)snapshot.frequency,
                  snapshot.valid ? 1 : 0);
-        metering_post_snapshot(&snapshot);
+
+        const esp_err_t post_ret = metering_post_snapshot(&snapshot);
+        if (post_ret != ESP_OK) {
+            if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+                const bool can_discard =
+                    (energy_delta.token != 0U) &&
+                    me->energy_delta_state.have_pending &&
+                    (me->energy_delta_state.pending_token == energy_delta.token);
+
+                if (can_discard) {
+                    const esp_err_t discard_ret = metering_energy_delta_discard(
+                        &me->energy_delta_state, energy_delta.token);
+                    if (discard_ret != ESP_OK) {
+                        ESP_LOGW(TAG,
+                                 "discard pending energy delta after post failure failed: %s",
+                                 esp_err_to_name(discard_ret));
+                    } else if (me->has_latest && me->latest.valid &&
+                               me->latest.energy_delta_token ==
+                                   energy_delta.token) {
+                        me->latest.energy_delta = 0.0f;
+                        me->latest.energy_delta_token = 0U;
+                    }
+                }
+                (void)xSemaphoreGive(me->mutex);
+            } else {
+                ESP_LOGW(TAG, "retake mutex after post failure failed");
+            }
+        }
     }
 }
 
 static void metering_on_bl0942_fault(void *arg, esp_event_base_t base,
-                                      int32_t id, void *event_data)
+                                     int32_t id, void *event_data)
 {
     metering_service_t *me = (metering_service_t *)arg;
-    const bl0942_fault_info_t *fault_info =
-        (const bl0942_fault_info_t *)event_data;
+    const bl0942_fault_info_t *fault = (const bl0942_fault_info_t *)event_data;
     metering_snapshot_t snapshot = {0};
 
     (void)base;
     (void)id;
+    (void)event_data;
 
     if (me == NULL) {
         return;
@@ -737,8 +767,16 @@ static void metering_on_bl0942_fault(void *arg, esp_event_base_t base,
     if (me->has_latest) {
         snapshot = me->latest;
     }
-    if (fault_info != NULL && fault_info->hard_reset_attempted) {
+    if (fault != NULL && fault->hard_reset_attempted) {
         metering_energy_delta_reset_baseline(&me->energy_delta_state);
+    } else if (me->energy_delta_state.have_pending) {
+        const esp_err_t discard_ret = metering_energy_delta_discard(
+            &me->energy_delta_state, me->energy_delta_state.pending_token);
+        if (discard_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "discard pending energy delta on transient fault failed: %s",
+                     esp_err_to_name(discard_ret));
+        }
     }
     snapshot.timestamp_us = (snapshot.timestamp_us != 0ULL) ?
                             snapshot.timestamp_us :
@@ -750,21 +788,24 @@ static void metering_on_bl0942_fault(void *arg, esp_event_base_t base,
     me->has_latest = true;
     (void)xSemaphoreGive(me->mutex);
 
-    metering_post_snapshot(&snapshot);
+    (void)metering_post_snapshot(&snapshot);
 }
 
-static void metering_post_snapshot(const metering_snapshot_t *snapshot)
+static esp_err_t metering_post_snapshot(const metering_snapshot_t *snapshot)
 {
+    esp_err_t ret = ESP_OK;
+
     if (snapshot == NULL) {
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
 
-    const esp_err_t ret = esp_event_post(METERING_EVENT_BASE,
-                                         METERING_EVENT_SNAPSHOT,
-                                         snapshot, sizeof(*snapshot),
-                                         pdMS_TO_TICKS(
-                                             METERING_EVENT_POST_TIMEOUT_MS));
+    ret = esp_event_post(METERING_EVENT_BASE,
+                         METERING_EVENT_SNAPSHOT,
+                         snapshot, sizeof(*snapshot),
+                         pdMS_TO_TICKS(METERING_EVENT_POST_TIMEOUT_MS));
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "post snapshot event failed: %s", esp_err_to_name(ret));
     }
+
+    return ret;
 }
