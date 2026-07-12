@@ -2,11 +2,6 @@
 
 ## ✅ 确认的问题
 
-### BL0942-FAULT-STOP — 故障停止条件在多数配置下失效
-
-- **原报告条目**: `main/bl0942/bl0942.c:1130-1131, 1141-1144` — 故障停止条件失效
-- **验证结论**: 确认。重新阅读 `bl0942.c:1116-1154`（采样任务完整循环）与 `:854-856`（`apply_defaults` 对 `hard_reset_max_attempts` 仅在 `< 0` 时填默认）、`:888-890`（校验仅要求 `>= 0`）。`hard_reset_count` 自增唯一发生在 `:1133`，其外层条件为 `en_gpio != GPIO_NUM_NC && hard_reset_count < hard_reset_max_attempts`（行 1130-1131）。停止条件 `:1141-1142` 要求 `hard_reset_count >= max && max > 0`。`rg` 搜索 `hard_reset_count` 确认全模块仅此处自增。四种配置组合中仅"en_gpio 有效且 max>0"能自停。`max==0` 是合法配置值（校验放行、defaults 不覆盖），落入此坑。默认配置（en_gpio 有效、max=3）正常，是未暴露的主因。
-
 ### BL0942-MUTEX-DELAY — 硬复位期间持锁 2 秒以上
 
 - **原报告条目**: `main/bl0942/bl0942.c:1071, 1074, 1015, 1018, 1107` — 持锁 vTaskDelay
@@ -25,15 +20,18 @@
 ### BL0942-TASK-COMPLEXITY — 采样任务故障处理嵌套较深
 
 - **原报告条目**: `main/bl0942/bl0942.c:1116-1154` — 圈复杂度偏高
-- **验证结论**: 确认。`bl0942_sample_task_entry`（`:1111-1166`）失败分支 `:1124-1145` 嵌套 4 层（while→else→if threshold→if en_gpio→if reset_ret），分支数约 12，处于 review-checklist §G 建议上限（≤10-15）内但偏高。可读性可改善，非缺陷。
+- **验证结论**: 确认。`bl0942_sample_task_entry`（`:1111-1166`）失败分支 `:1124-1145` 嵌套 4 层（while→else→if threshold→if en_gpio→if reset_ret），分支数约 12，处于 review-checklist §G 建议上限（≤10-15）内但偏高。该路径已值得记录为低严重度代码质量问题，后续可通过拆分故障处理分支改善可读性与维护性。
+
+## ⚠️ 部分正确（需调整修复方案）
+
+### BL0942-FAULT-STOP — 故障自停仅覆盖“有 EN 且达到硬复位上限”场景
+
+- **原报告条目**: `main/bl0942/bl0942.c:1130-1131, 1141-1144` — 故障停止条件失效
+- **验证结论**: 部分正确。重新阅读 `bl0942.c:1116-1154`（采样任务完整循环）、`:854-856`（`apply_defaults` 对 `hard_reset_max_attempts` 仅在 `< 0` 时填默认）、`:873-890`（校验允许 `en_gpio == GPIO_NUM_NC` 且 `hard_reset_max_attempts >= 0`）以及 `bl0942.h:49,58`（公开配置字段注释）。源码事实成立：`hard_reset_count` 只在 `bl0942.c:1130-1134` 的 `en_gpio != GPIO_NUM_NC && hard_reset_count < hard_reset_max_attempts` 分支内自增，而停止条件 `:1141-1142` 还要求 `hard_reset_count >= hard_reset_max_attempts && hard_reset_max_attempts > 0`。因此当前自停逻辑只覆盖“有 EN 且达到硬复位上限”的情形。但公开配置契约没有把 `en_gpio == GPIO_NUM_NC` 或 `hard_reset_max_attempts == 0` 的期望语义说清楚：它们究竟表示“禁用硬复位但仍应在有限容忍后停机”，还是“允许持续故障上报而不自停”，源码与头文件都未定义。更准确的判定是设计/文档缺口，而非已确认实现缺陷；只有在项目明确期望无 EN 或 `max=0` 也应有限容忍后停机时，这才构成真实缺陷。
 
 ## ❌ 误报
 
 无。
-
-## ⚠️ 部分正确（需调整修复方案）
-
-无。所有发现均经源码与 `rg` 交叉验证后确认。
 
 ## 修复记录
 
@@ -77,7 +75,7 @@ N/A（review-only，本阶段不修改源代码）。
   - `bl0942_stop_impl` 超时：返回 `ESP_ERR_TIMEOUT`，`stop_in_progress` 复位（`:816-820`）✅
   - `bl0942_destroy` 中 `uart_delete` 失败：give mutex、记日志、返回错误，句柄保留可重试（`:443-448`）✅
   - 无 `ESP_ERROR_CHECK`/`abort()` 在可恢复路径 ✅
-  - **缺口**：故障自停条件在 en_gpio==NC 或 max==0 时失效（见 BL0942-FAULT-STOP）⚠️
+  - **缺口**：公开配置契约未定义 `en_gpio == GPIO_NUM_NC` 或 `hard_reset_max_attempts == 0` 时故障是否仍应在有限容忍后自停；当前实现仅覆盖“有 EN 且达到硬复位上限”的自停路径 ⚠️
 
 - **Cross-module contract review**:
   - bl0942 属驱动适配层（architecture.md §3.4），不 include 任何业务/网络/应用层头文件 ✅
@@ -87,8 +85,8 @@ N/A（review-only，本阶段不修改源代码）。
   - 不破坏分层契约。
 
 - **Residual risks**:
-  - **BL0942-FAULT-STOP 未修复**：`en_gpio == GPIO_NUM_NC` 或 `hard_reset_max_attempts == 0` 配置下，BL0942 永久故障时采样任务不自停，持续发布 FAULT 事件。默认硬件配置（en_gpio 有效、max=3）不受影响。
+  - **故障自停语义仍待澄清**：`en_gpio == GPIO_NUM_NC` 或 `hard_reset_max_attempts == 0` 时，当前实现会持续发布 FAULT 事件而不自停。若项目期望“禁用硬复位但仍在有限容忍后停机”，则这里仍需补实现；若项目允许持续故障上报，则应补公开文档说明。默认硬件配置（en_gpio 有效、max=3）不受影响。
   - **BL0942-MUTEX-DELAY 未修复**：未来若有任务并发调用 `bl0942_read`/`bl0942_get_latest`，硬复位期间会被阻塞 2s+。当前无外部调用方。
   - **UART 帧字段字节序/偏移未对照 datasheet 核验**：`bl0942_parse_packet`（`:950-962`）中 `freq_raw` 按 big-endian 解码（`frame[17]<<8 | frame[16]`），其余 24-bit 字段按 little-endian；`status_raw` 为单字节填入 `uint16_t`（高字节为 0）；`frame[18]`/`frame[20]`/`frame[21]` 未解析。checksum 覆盖全帧保证完整性，但字段语义正确性依赖未验证的协议假设，需上机抓包或对照 `reference/` 下 BL0942 datasheet 确认。
   - **`bl0942_get_latest` 文档漂移即时影响为零**（当前无外部调用方），但 API 公开后若据文档改为无锁会引入 `uint64_t` 撕裂读。
-  - **采样任务优先级 5**：与默认事件循环任务（ESP-IDF `sys_evt` 通常优先级 20）相比偏低，`esp_event_post` 的 10ms 超时在事件循环繁忙时可能丢弃测量事件——属设计权衡，非缺陷。
+  - **采样任务优先级 5**：与默认事件循环任务（ESP-IDF `sys_evt` 通常优先级 20）相比偏低，`esp_event_post` 的 10ms 超时在事件循环繁忙时可能丢弃测量事件——属设计权衡，当前未单列为本轮问题。

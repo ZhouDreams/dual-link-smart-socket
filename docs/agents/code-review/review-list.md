@@ -26,6 +26,7 @@
 ## 审查进度说明
 
 - 状态：`⬜ Pending` / `🔄 In Progress` / `✅ Done` / `⏭️ Skipped`
-- 全部 14 个模块已完成阶段 2（report-*.md）+ 阶段 3（verify-*.md）
+- 全部 14 个模块现已完成阶段 2（`report-*.md`）+ 阶段 3（`verify-*.md`）
+- 此前 `button` 模块的 verify 覆盖说明缺口，已在本次文档修复中补齐
 - 本次只做检查 + 验证 + 报告，不做阶段 4（修复）
 - 汇总报告见 `summary-2026-07-07.md`

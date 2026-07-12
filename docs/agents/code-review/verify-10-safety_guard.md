@@ -2,9 +2,6 @@
 
 ## ✅ 确认的问题
 
-- **原报告条目**: 🟡 safety_guard.c:520-534 — `esp_event_post` 失败时安全快照被静默丢弃
-  - 验证结论: 确认。重新阅读 `safety_guard_post_snapshot`（`:520-535`）与 handler（`:487-518`）：handler 在 `:515` 释放 `me->mutex` 后于 `:517` 调用 `post_snapshot`；`post_snapshot` 内 `esp_event_post` 失败时仅 `ESP_LOGW`（`:533`）后返回，无重试、无备用通知通道。`rg` 搜索确认 `app_controller_on_safety_snapshot`（`app_controller.c:466-486`）是唯一对 `SAFETY_GUARD_EVENT_SNAPSHOT` 做出 `relay_set` 反应的订阅者（注册于 `:703-709`）。`app_controller.c:1004` 虽调用 `safety_guard_get_latest`，但仅读取 `safety.level` / `safety.valid` 用于遥测组装（`:1015-1016`），不检查 `suggested_action`，不触发继电器动作。因此 post 失败时继电器不会在本周期断开，需等下一秒 metering snapshot 重试。缓解因素：`persistence_samples`（默认 3）要求持续超限才触发 DANGER，存在多周期重试机会。
-
 - **原报告条目**: 🟡 classes.md:1438-1446 vs safety_guard.c:45-56 — 内部结构体文档漂移
   - 验证结论: 确认。classes.md §10.4 内部结构（`:1438-1446`）列出 7 个字段：`config / mutex / latest / has_latest / overcurrent_persistence / overpower_persistence / initialized`。实际 `safety_guard.c:45-56` 定义 10 个字段，额外包含 `metering_handler`（`:52`，`esp_event_handler_instance_t`）、`started`（`:54`，`bool`）、`stopping`（`:55`，`bool`）。这三个字段实现 start/stop 状态机，`stopping` 标志被 handler 在 `:507` 检查以实现优雅停止。
 
@@ -26,7 +23,9 @@
 
 ## ⚠️ 部分正确（需调整修复方案）
 
-（无）
+- **原报告条目**: 🟡 safety_guard.c:520-534 — `esp_event_post` 失败时安全快照被静默丢弃
+  - 验证结论: 核心结论确认，但失败机制说明需要修正。重新阅读 `safety_guard_post_snapshot`（`safety_guard.c:520-535`）与 handler（`:487-518`）：handler 在 `:515` 释放 `me->mutex` 后于 `:517` 调用 `post_snapshot`；`post_snapshot` 内 `esp_event_post` 失败时仅 `ESP_LOGW`（`:533`）后返回，无重试、无备用通知通道。`app_controller_on_safety_snapshot`（`app_controller.c:466-486`）是唯一对 `SAFETY_GUARD_EVENT_SNAPSHOT` 做出 `relay_set(RELAY_SOURCE_SAFETY, false)` 反应的订阅者；`app_controller.c:1004-1016` 虽调用 `safety_guard_get_latest`，但仅读取 `safety.level` / `safety.valid` 用于遥测组装，不检查 `suggested_action`，不触发继电器动作。因此 `esp_event_post` 失败时，本周期安全快照仍会丢失，`app_controller` 也不会在该周期执行 `relay_set(RELAY_SOURCE_SAFETY, false)`。
+  - 修正点: 失败原因不能再归因为调用方传入的等待时间会自然耗尽。依据 ESP-IDF `esp_event_post_to` 实现（`esp_event.c:962-966`），当 dedicated loop task 向自身 post 时会走 `xQueueSendToBack(loop->queue, &post, 0)`，即忽略调用方传入的 `ticks_to_wait` 并执行零等待发送；因此真正可确认的失败机制是“若事件队列已满，则此次 self-post 会立即失败并返回 `ESP_ERR_TIMEOUT`”。本条应按“结论正确、机理表述需改”处理。
 
 ## 修复记录
 
@@ -57,7 +56,7 @@
   - `xSemaphoreCreateMutex` 失败：`free(me)` 返回 NULL ✓
   - `esp_event_handler_instance_register` 失败：释放 mutex 返回错误码 ✓
   - `esp_event_handler_instance_unregister` 失败：保留 handler 注册状态，`metering_handler` 不清空，`started` 不重置，`stopping` 复位为 false，返回错误码；`destroy` 在 `stop` 失败时不释放 `me` ✓
-  - `esp_event_post` 失败：仅记日志，快照丢失（见中严重度 #1）⚠️
+  - `esp_event_post` 失败：仅记日志，快照丢失（见 ⚠️ 第 1 条）⚠️
   - `xSemaphoreTake` 失败（handler `:503`）：记日志跳过本次评估 ✓
 
 - **Cross-module contract review**:
@@ -68,6 +67,6 @@
   - `app_controller_stop_modules` 停止顺序：dashboard → tb → network → safety_guard → metering → bl0942，消费方先于生产方停止 ✓
 
 - **Residual risks**:
-  - `esp_event_post` 失败导致安全快照丢失（中严重度 #1）：在事件循环队列拥塞时可能延迟继电器断开 1 s+。需上机压力测试验证队列是否会在正常运行中填满。
+  - `esp_event_post` 失败导致安全快照丢失（见 ⚠️ 第 1 条）：在事件循环队列已满且 self-post 立即失败时，可能延迟继电器断开 1 s+。需上机压力测试验证队列是否会在正常运行中填满。
   - handler 中 `portMAX_DELAY` 获取 mutex（低严重度 #4）：若未来有高优先级任务长时间持有 `me->mutex`（如新增的 API），可能阻塞事件循环。当前所有持有者均为快速操作。
   - ESP-IDF `esp_event_handler_instance_unregister` 在 Path B（loop 正在分发）中调用 `esp_event_post_to(..., portMAX_DELAY)` 投递 cleanup 事件：若事件队列恰好已满且其他任务持续 post，理论上可能阻塞 unregister 调用者。实际概率极低（需队列满 + 持续 post），但属于 ESP-IDF 内部行为，safety_guard 无法控制。

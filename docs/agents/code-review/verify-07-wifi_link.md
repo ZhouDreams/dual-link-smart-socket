@@ -2,23 +2,10 @@
 
 ## ✅ 确认的问题
 
-### D-1: `esp_mqtt_client_stop` 返回非 ESP_OK/ESP_FAIL 时 MQTT 客户端资源泄漏
-
-- **原报告条目**: D-1（wifi_link.c:966）
-- **验证结论**: 确认。重新阅读行 958-984 上下文：
-  - 行 959：`ret = esp_mqtt_client_stop(mqtt_client)`
-  - 行 966：`if (ret == ESP_OK || ret == ESP_FAIL)` — 仅这两种返回值才执行 destroy
-  - 行 967：`esp_mqtt_client_destroy(mqtt_client)` 在条件内
-  - 行 978-979：`me->mqtt_client = NULL` 在 destroy 成功分支内
-
-  ESP-IDF `esp_mqtt_client_stop` 可返回 `ESP_ERR_INVALID_STATE`（客户端未启动）。此时代码跳过 destroy，`me->mqtt_client` 保留指向已 stop 但未 destroy 的客户端。后续 `start_impl` 行 532 检查 `me->mqtt_client != NULL` 返回 `ESP_ERR_INVALID_STATE`，链路永久不可重启。
-
-  **触发概率**：低（正常流程 stop 返回 ESP_OK），但边缘状态（如 client 内部 task 已自行退出）可能触发。影响严重（永久链路失效 + 资源泄漏）。
-
 ### H-1: 文档漂移 — `esp_mqtt_client_enqueue` vs `esp_mqtt_client_publish`
 
 - **原报告条目**: H-1（classes.md:1124 vs wifi_link_internal.c:42）
-- **验证结论**: 确认。`rg "esp_mqtt_client_enqueue"` 搜索结果为空——全项目未使用 `enqueue` API。`wifi_link_internal.c:42` 使用 `esp_mqtt_client_publish`（同步）。classes.md:1124 明确记载 `esp_mqtt_client_enqueue()`。文档与实现不一致。
+- **验证结论**: 确认。`rg "esp_mqtt_client_enqueue"` 搜索结果为空——全项目未使用 `enqueue` API。`wifi_link_internal.c:42` 实际调用 `esp_mqtt_client_publish()`。ESP-IDF 公开头文件 `mqtt_client.h:546-581` 说明 `esp_mqtt_client_publish()` 可能阻塞，而 `esp_mqtt_client_enqueue()` 是将消息放入 outbox、由 mqtt task 后续发送的非阻塞版本。classes.md:1124 明确记载 `esp_mqtt_client_enqueue()`。文档与实现存在语义漂移：文档写 enqueue，实装写 publish，后者可能阻塞，且与 enqueue 的非阻塞语义不同。
 
 ### H-2: 文档漂移 — 订阅表条目 `char topic[]` vs `char *topic`
 
@@ -78,13 +65,22 @@
 
 ## ❌ 误报
 
-（无）
+### D-1: `esp_mqtt_client_stop` 返回非 ESP_OK/ESP_FAIL 时 MQTT 客户端资源泄漏
+
+- **原报告条目**: D-1（wifi_link.c:966）
+- **验证结论**: 误报。重新阅读 `wifi_link.c:958-984` 上下文可确认：
+  - 行 959：`ret = esp_mqtt_client_stop(mqtt_client)`
+  - 行 966：`if (ret == ESP_OK || ret == ESP_FAIL)` — 仅这两种返回值才执行 destroy
+  - 行 967：`esp_mqtt_client_destroy(mqtt_client)` 在条件内
+  - 行 978-979：`me->mqtt_client = NULL` 在 destroy 成功分支内
+
+  但当前可验证的公开契约只有 `mqtt_client.h:453-456`：`esp_mqtt_client_stop()` 仅声明返回 `ESP_OK`、`ESP_ERR_INVALID_ARG`、`ESP_FAIL`。原结论依赖把 `ESP_ERR_INVALID_STATE` 视为既定返回值，而这一点不在当前公开返回值契约内。基于现有证据，无法把“stop 返回 `ESP_ERR_INVALID_STATE`，从而跳过 destroy 并永久保留客户端”当作已证实路径，因此该条应改判为误报。
 
 ---
 
 ## ⚠️ 部分正确（需调整修复方案）
 
-（无——所有发现均在验证中确认）
+（无）
 
 ---
 
@@ -141,12 +137,12 @@ N/A（review-only，无代码改动）
 | `start_impl` 中 netif/event/wifi init 失败 | ✅ | cleanup 标签回滚（行 685-701），调 `cleanup_resources` |
 | `esp_mqtt_client_init` 失败 | ✅ | 返回 ESP_FAIL，`start_mqtt` 调用方记录 `start_failed`（行 1481） |
 | `esp_mqtt_client_start` 失败 | ✅ | destroy client + set NULL（行 1553-1561） |
-| `esp_mqtt_client_stop` 返回非预期错误 | ⚠️ | D-1：destroy 被跳过，客户端泄漏 |
+| `esp_mqtt_client_stop` 清理分支 | ✅ | 公开头文件仅声明 `ESP_OK` / `ESP_ERR_INVALID_ARG` / `ESP_FAIL`；现有证据不足以确认存在额外返回值导致 destroy 被错误跳过 |
 | `strdup(topic)` 失败（subscribe） | ✅ | 返回 ESP_ERR_NO_MEM，entry 不标记 in_use（行 1373-1375） |
 | `malloc(topic)` 失败（MQTT_EVENT_DATA） | ✅ | 记日志 + end_runtime_action + return（行 1662-1665） |
 | `esp_mqtt_client_subscribe` 失败 | ✅ | 返回 ESP_FAIL（行 857），但订阅意图已存入 sub_table，重连时重放 |
 | `esp_mqtt_client_publish` 失败 | ✅ | 返回 ESP_FAIL（wifi_link_internal.c:45），end_mqtt_op 正常执行 |
-| netif destroy 条件 | ⚠️ | D-2：依赖 deinit 返回值，理论可跳过 |
+| netif destroy 条件 | 已检查 | D-2 已在上文确认为问题：销毁逻辑依赖 deinit 返回值，理论上可能跳过 netif destroy |
 
 ### Cross-module contract review
 
@@ -156,12 +152,11 @@ N/A（review-only，无代码改动）
 - ✅ wifi_link 不理解业务遥测字段，只做 MQTT 透传
 - ✅ rx_cb 数据契约清晰：topic 为 wifi_link owned（回调期间 borrowed），data 为 esp_mqtt borrowed
 - ✅ 不直接依赖 thingsboard_client 或上层业务模块
-- ⚠️ publish 使用同步 `esp_mqtt_client_publish`（阻塞），可能影响 thingsboard_client 任务实时性（文档记载为非阻塞 enqueue）
+- publish 使用 `esp_mqtt_client_publish`；公开文档说明其可能阻塞，且与 classes.md 记载的非阻塞 enqueue 语义不同，可能影响 thingsboard_client 任务实时性
 
 ### Residual risks
 
-1. **MQTT 客户端泄漏（D-1）**：`esp_mqtt_client_stop` 返回非预期错误时客户端未 destroy，链路永久失效。实际触发概率低，但上机长时间运行可能暴露。
-2. **`portMAX_DELAY` mutex 获取**：全模块 mutex 操作使用 `portMAX_DELAY`，若出现未预见的死锁，系统永久挂起无恢复机制。当前分析未发现死锁路径，但无法排除所有可能。
-3. **MQTT 事件回调与 destroy 的竞态**：`esp_mqtt_client_destroy` 是否等待所有 pending 事件回调完成取决于 ESP-IDF 内部实现。若不等，destroy 后回调可能访问已释放的 `me`。当前代码通过 `runtime_action_count` 保护，但 `MQTT_EVENT_DISCONNECTED` 处理（行 1622-1631）不使用 runtime_action_count，仅依赖 mutex 序列化——若 destroy 在回调 take mutex 前释放了 `me`，存在 use-after-free 理论风险。
-4. **Wi-Fi 事件回调阻塞 event loop**：Wi-Fi 事件处理器使用 `xSemaphoreTake(mutex, portMAX_DELAY)`（行 1421、1435），若 mutex 被长时间持有，ESP-IDF event loop 任务被阻塞，影响其他系统事件处理。当前 mutex 持有时间短（微秒级），实际风险低。
-5. **同步 publish 阻塞调用方**：`esp_mqtt_client_publish` 在 QoS > 0 时阻塞至 PUBACK，若 broker 不可达，调用方任务（thingsboard_client）被阻塞直至 MQTT 内部超时。`runtime_action_count > 0` 期间 stop/destroy 无法推进。
+1. **`portMAX_DELAY` mutex 获取**：全模块 mutex 操作使用 `portMAX_DELAY`，若出现未预见的死锁，系统永久挂起无恢复机制。当前分析未发现死锁路径，但无法排除所有可能。
+2. **MQTT 事件回调与 destroy 的竞态**：`esp_mqtt_client_destroy` 是否等待所有 pending 事件回调完成取决于 ESP-IDF 内部实现。若不等，destroy 后回调可能访问已释放的 `me`。当前代码通过 `runtime_action_count` 保护，但 `MQTT_EVENT_DISCONNECTED` 处理（行 1622-1631）不使用 runtime_action_count，仅依赖 mutex 序列化——若 destroy 在回调 take mutex 前释放了 `me`，存在 use-after-free 理论风险。
+3. **Wi-Fi 事件回调阻塞 event loop**：Wi-Fi 事件处理器使用 `xSemaphoreTake(mutex, portMAX_DELAY)`（行 1421、1435），若 mutex 被长时间持有，ESP-IDF event loop 任务被阻塞，影响其他系统事件处理。当前 mutex 持有时间短（微秒级），实际风险低。
+4. **同步 publish 可能阻塞调用方**：`mqtt_client.h:549-581` 说明 `esp_mqtt_client_publish()` 可能阻塞；相比 classes.md 记载的 `enqueue` 非阻塞语义，当前实现可能让调用方任务（thingsboard_client）在用户任务上下文中停顿更久，`runtime_action_count > 0` 期间 stop/destroy 也需要等待。
