@@ -39,10 +39,13 @@ typedef struct network_link network_link_t;
 /**
  * @brief 销毁网络链路
  * @details Destroy network link
+ * @note 仅 ESP_OK 表示句柄已被释放；任何错误返回都保留句柄所有权，调用方不得释放其内存。
+ *       Only ESP_OK consumes the handle; any error preserves caller ownership and the caller must not free its memory.
  * @param[in] me 网络链路句柄； Network link handle
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_NOT_SUPPORTED: 不支持销毁； Destroy not supported
+ *         - ESP_ERR_TIMEOUT: 等待在途操作或回调退出超时； In-flight operation or callback drain timed out
  */
 esp_err_t network_link_destroy(network_link_t *me);
 
@@ -123,6 +126,8 @@ esp_err_t network_link_unsubscribe(network_link_t *me, const char *topic);
 /**
  * @brief 注册下行消息回调
  * @details Register RX message callback
+ * @note cb 为 NULL 时，ESP_OK 保证旧回调及 ctx 已不再被使用；ESP_ERR_TIMEOUT 时旧 ctx 必须继续有效。
+ *       When cb is NULL, ESP_OK guarantees the old callback and ctx are no longer used; after ESP_ERR_TIMEOUT the old ctx must remain valid.
  * @param[in] me 网络链路句柄； Network link handle
  * @param[in] cb 下行消息回调； RX message callback
  * @param[in] ctx 用户上下文； User context
@@ -130,6 +135,7 @@ esp_err_t network_link_unsubscribe(network_link_t *me, const char *topic);
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_NOT_SUPPORTED: 不支持回调注册； Register callback not supported
+ *         - ESP_ERR_TIMEOUT: 等待在途回调超时； In-flight callback drain timed out
  */
 esp_err_t network_link_register_rx_cb(network_link_t *me,
                                       network_rx_cb_t cb, void *ctx);

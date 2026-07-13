@@ -30,7 +30,9 @@
 #define TAG "thingsboard_client"
 #define TB_DEFAULT_JSON_BUF_SIZE (512)
 #define TB_STOP_POLL_MS          (10U)
+#define TB_STOP_TIMEOUT_MS       (5000U)
 #define TB_COMMAND_DRAIN_POLL_MS (10U)
+#define TB_COMMAND_DRAIN_TIMEOUT_MS (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -47,6 +49,8 @@ struct thingsboard_client {
     bool started;
     bool stopping;
     bool destroying;
+    bool network_rx_registered;
+    bool cleanup_pending;
 };
 
 /**********************
@@ -167,19 +171,28 @@ thingsboard_client_t *thingsboard_client_create(const tb_client_config_t *config
 
 esp_err_t thingsboard_client_destroy(thingsboard_client_t *me)
 {
+    esp_err_t ret = ESP_OK;
+
     if (me == NULL) {
         return ESP_OK;
     }
 
     if (me->mutex != NULL) {
-        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
-            me->destroying = true;
-            (void)xSemaphoreGive(me->mutex);
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
         }
+        me->destroying = true;
+        (void)xSemaphoreGive(me->mutex);
     }
 
-    (void)thingsboard_client_stop(me);
-    (void)thingsboard_client_register_command_cb(me, NULL, NULL);
+    ret = thingsboard_client_stop(me);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = thingsboard_client_register_command_cb(me, NULL, NULL);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     if (me->mutex != NULL) {
         vSemaphoreDelete(me->mutex);
@@ -193,6 +206,7 @@ esp_err_t thingsboard_client_destroy(thingsboard_client_t *me)
 esp_err_t thingsboard_client_start(thingsboard_client_t *me)
 {
     esp_err_t ret;
+    esp_err_t cleanup_ret;
     bool subscribed_rpc = false;
     bool subscribed_attributes = false;
 
@@ -206,7 +220,7 @@ esp_err_t thingsboard_client_start(thingsboard_client_t *me)
         (void)xSemaphoreGive(me->mutex);
         return ESP_OK;
     }
-    if (me->destroying || me->stopping) {
+    if (me->destroying || me->stopping || me->cleanup_pending) {
         (void)xSemaphoreGive(me->mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -226,8 +240,11 @@ esp_err_t thingsboard_client_start(thingsboard_client_t *me)
                                         NETWORK_MQTT_QOS0);
         if (ret != ESP_OK) {
             if (subscribed_rpc) {
-                (void)network_manager_unsubscribe(me->config.net_mgr,
-                                                  TB_TOPIC_RPC_REQUEST_SUB);
+                cleanup_ret = network_manager_unsubscribe(
+                    me->config.net_mgr, TB_TOPIC_RPC_REQUEST_SUB);
+                if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_NOT_FOUND) {
+                    me->cleanup_pending = true;
+                }
             }
             (void)xSemaphoreGive(me->mutex);
             return ret;
@@ -239,31 +256,50 @@ esp_err_t thingsboard_client_start(thingsboard_client_t *me)
                                          thingsboard_client_on_rx, me);
     if (ret != ESP_OK) {
         if (subscribed_attributes) {
-            (void)network_manager_unsubscribe(me->config.net_mgr,
-                                              TB_TOPIC_ATTRIBUTES);
+            cleanup_ret = network_manager_unsubscribe(me->config.net_mgr,
+                                                       TB_TOPIC_ATTRIBUTES);
+            if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_NOT_FOUND) {
+                me->cleanup_pending = true;
+            }
         }
         if (subscribed_rpc) {
-            (void)network_manager_unsubscribe(me->config.net_mgr,
-                                              TB_TOPIC_RPC_REQUEST_SUB);
+            cleanup_ret = network_manager_unsubscribe(
+                me->config.net_mgr, TB_TOPIC_RPC_REQUEST_SUB);
+            if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_NOT_FOUND) {
+                me->cleanup_pending = true;
+            }
         }
         (void)xSemaphoreGive(me->mutex);
         return ret;
     }
+    me->network_rx_registered = true;
 
     if (me->destroying || me->stopping) {
-        (void)network_manager_register_rx_cb(me->config.net_mgr, NULL, NULL);
+        ret = network_manager_register_rx_cb(me->config.net_mgr, NULL, NULL);
+        if (ret == ESP_OK || ret == ESP_ERR_NOT_FOUND) {
+            me->network_rx_registered = false;
+        } else {
+            me->cleanup_pending = true;
+        }
         if (subscribed_attributes) {
-            (void)network_manager_unsubscribe(me->config.net_mgr,
-                                              TB_TOPIC_ATTRIBUTES);
+            cleanup_ret = network_manager_unsubscribe(me->config.net_mgr,
+                                                       TB_TOPIC_ATTRIBUTES);
+            if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_NOT_FOUND) {
+                me->cleanup_pending = true;
+            }
         }
         if (subscribed_rpc) {
-            (void)network_manager_unsubscribe(me->config.net_mgr,
-                                              TB_TOPIC_RPC_REQUEST_SUB);
+            cleanup_ret = network_manager_unsubscribe(
+                me->config.net_mgr, TB_TOPIC_RPC_REQUEST_SUB);
+            if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_NOT_FOUND) {
+                me->cleanup_pending = true;
+            }
         }
         (void)xSemaphoreGive(me->mutex);
         return ESP_ERR_INVALID_STATE;
     }
     me->started = true;
+    me->cleanup_pending = false;
     (void)xSemaphoreGive(me->mutex);
 
     return ESP_OK;
@@ -276,6 +312,9 @@ esp_err_t thingsboard_client_stop(thingsboard_client_t *me)
     network_manager_t *net_mgr;
     bool enable_rpc;
     bool enable_attributes;
+    bool network_rx_registered;
+    bool network_rx_cleared = false;
+    uint32_t waited_ms = 0U;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "client is null");
@@ -284,25 +323,37 @@ esp_err_t thingsboard_client_stop(thingsboard_client_t *me)
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
     while (!me->started && me->stopping) {
+        if (waited_ms >= TB_STOP_TIMEOUT_MS) {
+            (void)xSemaphoreGive(me->mutex);
+            ESP_LOGE(TAG, "wait for concurrent stop timed out");
+            return ESP_ERR_TIMEOUT;
+        }
         (void)xSemaphoreGive(me->mutex);
         vTaskDelay(pdMS_TO_TICKS(TB_STOP_POLL_MS));
+        waited_ms += TB_STOP_POLL_MS;
         ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                             ESP_ERR_TIMEOUT, TAG, "take mutex failed");
     }
-    if (!me->started) {
+    if (!me->started && !me->network_rx_registered && !me->cleanup_pending) {
         (void)xSemaphoreGive(me->mutex);
         return ESP_OK;
     }
     me->stopping = true;
     me->started = false;
+    me->cleanup_pending = true;
     net_mgr = me->config.net_mgr;
     enable_rpc = me->config.enable_rpc;
     enable_attributes = me->config.enable_attributes;
+    network_rx_registered = me->network_rx_registered;
     (void)xSemaphoreGive(me->mutex);
 
-    ret = network_manager_register_rx_cb(net_mgr, NULL, NULL);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
-        first_error = ret;
+    if (network_rx_registered) {
+        ret = network_manager_register_rx_cb(net_mgr, NULL, NULL);
+        if (ret == ESP_OK || ret == ESP_ERR_NOT_FOUND) {
+            network_rx_cleared = true;
+        } else {
+            first_error = ret;
+        }
     }
 
     if (enable_rpc) {
@@ -323,6 +374,12 @@ esp_err_t thingsboard_client_stop(thingsboard_client_t *me)
 
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    if (network_rx_cleared) {
+        me->network_rx_registered = false;
+    }
+    if (first_error == ESP_OK) {
+        me->cleanup_pending = false;
+    }
     me->stopping = false;
     (void)xSemaphoreGive(me->mutex);
 
@@ -642,6 +699,7 @@ static esp_err_t thingsboard_client_wait_command_callbacks_drained(
     thingsboard_client_t *me)
 {
     bool drained = false;
+    uint32_t waited_ms = 0U;
 
     while (!drained) {
         if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
@@ -651,7 +709,12 @@ static esp_err_t thingsboard_client_wait_command_callbacks_drained(
         (void)xSemaphoreGive(me->mutex);
 
         if (!drained) {
+            if (waited_ms >= TB_COMMAND_DRAIN_TIMEOUT_MS) {
+                ESP_LOGE(TAG, "wait for command callbacks timed out");
+                return ESP_ERR_TIMEOUT;
+            }
             vTaskDelay(pdMS_TO_TICKS(TB_COMMAND_DRAIN_POLL_MS));
+            waited_ms += TB_COMMAND_DRAIN_POLL_MS;
         }
     }
 

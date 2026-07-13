@@ -29,6 +29,7 @@
 #define TAG "app_controller"
 #define APP_CONTROLLER_RPC_BUF_SIZE (96)
 #define APP_CONTROLLER_LIFECYCLE_POLL_MS (10U)
+#define APP_CONTROLLER_LIFECYCLE_TIMEOUT_MS (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -418,6 +419,7 @@ static esp_err_t app_controller_stop_impl(app_controller_t *me,
 {
     esp_err_t first_error = ESP_OK;
     esp_err_t ret = ESP_OK;
+    uint32_t waited_ms = 0U;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "controller is null");
@@ -427,8 +429,14 @@ static esp_err_t app_controller_stop_impl(app_controller_t *me,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
     while (!from_start_rollback && me->starting) {
+        if (waited_ms >= APP_CONTROLLER_LIFECYCLE_TIMEOUT_MS) {
+            (void)xSemaphoreGive(me->mutex);
+            ESP_LOGE(TAG, "wait for controller start timed out");
+            return ESP_ERR_TIMEOUT;
+        }
         (void)xSemaphoreGive(me->mutex);
         vTaskDelay(pdMS_TO_TICKS(APP_CONTROLLER_LIFECYCLE_POLL_MS));
+        waited_ms += APP_CONTROLLER_LIFECYCLE_POLL_MS;
         ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                             ESP_ERR_TIMEOUT, TAG, "take mutex failed");
     }

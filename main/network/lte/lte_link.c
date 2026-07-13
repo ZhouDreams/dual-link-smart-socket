@@ -37,6 +37,7 @@
 #define LTE_LINK_DEFAULT_BAUD_RATE         (115200)
 #define LTE_LINK_PRIMARY_CID               (1)
 #define LTE_LINK_RX_CB_POLL_MS             (10U)
+#define LTE_LINK_RX_CB_TIMEOUT_MS          (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -54,7 +55,7 @@ typedef struct lte_link {
     char *mqtt_client_id;
     char *mqtt_username;
     char *mqtt_password;
-    lwlte_handle_t *lwlte;
+    lwlte_handle_t lwlte;
     lte_link_sub_entry_t *sub_table;
     int sub_table_size;
     int max_topic_len;
@@ -192,7 +193,7 @@ static lte_link_t *lte_link_from_base(network_link_t *base)
 static esp_err_t lte_link_destroy_impl(network_link_t *base)
 {
     esp_err_t ret = ESP_OK;
-    lwlte_handle_t *lwlte = NULL;
+    lwlte_handle_t lwlte = NULL;
 
     if (base == NULL) {
         return ESP_OK;
@@ -474,6 +475,8 @@ static esp_err_t lte_link_set_active_impl(network_link_t *base, bool active)
 
 static esp_err_t lte_link_wait_rx_callbacks_drained(lte_link_t *me)
 {
+    uint32_t waited_ms = 0U;
+
     ESP_RETURN_ON_FALSE(me != NULL && me->mutex != NULL, ESP_ERR_INVALID_ARG,
                         TAG, "invalid argument");
 
@@ -485,7 +488,13 @@ static esp_err_t lte_link_wait_rx_callbacks_drained(lte_link_t *me)
         if (active_rx_callbacks == 0) {
             return ESP_OK;
         }
+        if (waited_ms >= LTE_LINK_RX_CB_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "wait for RX callbacks timed out: active=%d",
+                     active_rx_callbacks);
+            return ESP_ERR_TIMEOUT;
+        }
         vTaskDelay(pdMS_TO_TICKS(LTE_LINK_RX_CB_POLL_MS));
+        waited_ms += LTE_LINK_RX_CB_POLL_MS;
     }
 }
 

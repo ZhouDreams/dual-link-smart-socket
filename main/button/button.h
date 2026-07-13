@@ -90,10 +90,13 @@ button_t *button_create(const button_config_t *config);
  *       Caller must externally serialize destroy against button_register_cb and any other use of the same handle.
  * @note Espressif button 组件头文件应隔离在内部 button_iot_adapter 后面；
  *       Espressif button component headers should stay isolated behind the internal button_iot_adapter.
+ * @note 仅 ESP_OK 表示句柄已被释放；失败时句柄及旧回调上下文仍须保持有效，不得继续普通访问。
+ *       Only ESP_OK consumes the handle; on failure the handle and old callback contexts must remain valid and must not be used normally.
  * @param[in] me 按键句柄； Button handle
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_FAIL: 删除底层按键失败； Underlying button delete failed
+ *         - ESP_ERR_TIMEOUT: 等待互斥量或在途回调超时； Mutex or in-flight callback timeout
  */
 esp_err_t button_destroy(button_t *me);
 
@@ -104,11 +107,13 @@ esp_err_t button_destroy(button_t *me);
  * @param[in] event 按键事件； Button event
  * @param[in] cb 回调，NULL 表示清除； Callback, NULL clears the slot
  * @param[in] user_ctx 用户上下文； User context
+ * @note cb 为 NULL 时，ESP_OK 保证旧回调及 user_ctx 已不再被使用；ESP_ERR_TIMEOUT 时旧 user_ctx 必须继续有效。
+ *       When cb is NULL, ESP_OK guarantees the old callback and user_ctx are no longer used; after ESP_ERR_TIMEOUT the old user_ctx must remain valid.
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
- *         - ESP_ERR_TIMEOUT: 获取互斥锁超时； Mutex timeout
+ *         - ESP_ERR_TIMEOUT: 等待互斥量或在途回调超时； Mutex or in-flight callback timeout
  */
 esp_err_t button_register_cb(button_t *me, button_event_t event,
                              button_event_cb_t cb, void *user_ctx);

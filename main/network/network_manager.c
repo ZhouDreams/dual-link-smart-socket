@@ -38,6 +38,7 @@
 #define NETWORK_MANAGER_STOP_TIMEOUT_MS           (3000U)
 #define NETWORK_MANAGER_STOP_POLL_MS              (100U)
 #define NETWORK_MANAGER_RX_CB_POLL_MS             (10U)
+#define NETWORK_MANAGER_RX_CB_TIMEOUT_MS          (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -725,6 +726,8 @@ esp_err_t network_manager_unsubscribe(network_manager_t *me,
 esp_err_t network_manager_register_rx_cb(network_manager_t *me,
                                           network_rx_cb_t cb, void *ctx)
 {
+    uint32_t waited_ms = 0U;
+
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "manager is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
@@ -736,8 +739,14 @@ esp_err_t network_manager_register_rx_cb(network_manager_t *me,
         me->rx_cb = NULL;
         me->rx_ctx = NULL;
         while (me->active_rx_callbacks > 0) {
+            if (waited_ms >= NETWORK_MANAGER_RX_CB_TIMEOUT_MS) {
+                (void)xSemaphoreGive(me->mutex);
+                ESP_LOGE(TAG, "wait for RX callbacks timed out");
+                return ESP_ERR_TIMEOUT;
+            }
             (void)xSemaphoreGive(me->mutex);
             vTaskDelay(pdMS_TO_TICKS(NETWORK_MANAGER_RX_CB_POLL_MS));
+            waited_ms += NETWORK_MANAGER_RX_CB_POLL_MS;
             ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                                 ESP_ERR_TIMEOUT, TAG,
                                 "take mutex failed");

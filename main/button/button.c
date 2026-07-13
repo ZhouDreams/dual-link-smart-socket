@@ -29,6 +29,7 @@
 
 #define TAG "button"
 #define BUTTON_CALLBACK_DRAIN_POLL_MS (10U)
+#define BUTTON_CALLBACK_DRAIN_TIMEOUT_MS (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -352,6 +353,7 @@ static esp_err_t button_wait_event_callbacks_drained(button_t *me,
                                                      button_event_t event)
 {
     bool drained = false;
+    uint32_t waited_ms = 0U;
 
     while (!drained) {
         if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
@@ -361,7 +363,13 @@ static esp_err_t button_wait_event_callbacks_drained(button_t *me,
         (void)xSemaphoreGive(me->mutex);
 
         if (!drained) {
+            if (waited_ms >= BUTTON_CALLBACK_DRAIN_TIMEOUT_MS) {
+                ESP_LOGE(TAG, "wait for event callback %d timed out",
+                         (int)event);
+                return ESP_ERR_TIMEOUT;
+            }
             vTaskDelay(pdMS_TO_TICKS(BUTTON_CALLBACK_DRAIN_POLL_MS));
+            waited_ms += BUTTON_CALLBACK_DRAIN_POLL_MS;
         }
     }
 
@@ -371,6 +379,7 @@ static esp_err_t button_wait_event_callbacks_drained(button_t *me,
 static esp_err_t button_wait_all_callbacks_drained(button_t *me)
 {
     bool drained = false;
+    uint32_t waited_ms = 0U;
 
     while (!drained) {
         drained = true;
@@ -387,7 +396,12 @@ static esp_err_t button_wait_all_callbacks_drained(button_t *me)
         (void)xSemaphoreGive(me->mutex);
 
         if (!drained) {
+            if (waited_ms >= BUTTON_CALLBACK_DRAIN_TIMEOUT_MS) {
+                ESP_LOGE(TAG, "wait for callbacks timed out");
+                return ESP_ERR_TIMEOUT;
+            }
             vTaskDelay(pdMS_TO_TICKS(BUTTON_CALLBACK_DRAIN_POLL_MS));
+            waited_ms += BUTTON_CALLBACK_DRAIN_POLL_MS;
         }
     }
 

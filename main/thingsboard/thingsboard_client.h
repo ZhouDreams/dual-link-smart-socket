@@ -109,9 +109,13 @@ thingsboard_client_t *thingsboard_client_create(const tb_client_config_t *config
 /**
  * @brief 销毁 ThingsBoard 客户端
  * @details Destroy ThingsBoard client
+ * @note 仅 ESP_OK 表示句柄已被释放；失败时网络或命令回调可能仍引用句柄，调用方须保留并重试 destroy。
+ *       Only ESP_OK consumes the handle; on failure network or command callbacks may still reference it, so the caller must retain it and retry destroy.
  * @param[in] me ThingsBoard 客户端句柄； ThingsBoard client handle
  * @return
  *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_TIMEOUT: 等待停止或回调退出超时； Stop or callback drain timed out
+ *         - 其他: 下层清理失败，句柄未释放； Lower cleanup failed and the handle remains owned
  */
 esp_err_t thingsboard_client_destroy(thingsboard_client_t *me);
 
@@ -123,6 +127,7 @@ esp_err_t thingsboard_client_destroy(thingsboard_client_t *me);
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待互斥量超时； Mutex timeout
  */
 esp_err_t thingsboard_client_start(thingsboard_client_t *me);
 
@@ -134,6 +139,7 @@ esp_err_t thingsboard_client_start(thingsboard_client_t *me);
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待并发停止或回调退出超时； Concurrent stop or callback drain timed out
  */
 esp_err_t thingsboard_client_stop(thingsboard_client_t *me);
 
@@ -199,10 +205,13 @@ esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
  * @param[in] me ThingsBoard 客户端句柄； ThingsBoard client handle
  * @param[in] cb 命令回调，NULL 表示清除； Command callback, NULL to clear
  * @param[in] ctx 用户上下文； User context
+ * @note cb 为 NULL 时，ESP_OK 保证旧回调及 ctx 已不再被使用；ESP_ERR_TIMEOUT 时旧 ctx 必须继续有效。
+ *       When cb is NULL, ESP_OK guarantees the old callback and ctx are no longer used; after ESP_ERR_TIMEOUT the old ctx must remain valid.
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待在途命令回调超时； In-flight command callback drain timed out
  */
 esp_err_t thingsboard_client_register_command_cb(thingsboard_client_t *me,
                                                  tb_command_cb_t cb,

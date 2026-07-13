@@ -91,9 +91,14 @@ metering_service_t *metering_service_create(const metering_config_t *config);
 /**
  * @brief 销毁电参量服务
  * @details Destroy a metering service
+ * @note 仅 ESP_OK 表示句柄已被释放；失败时事件处理器可能仍引用句柄，调用方须保留句柄并重试 stop/destroy。
+ *       Only ESP_OK consumes the handle; on failure event handlers may still reference it, so the caller must retain it and retry stop/destroy.
  * @param[in] me 服务句柄，可为 NULL
  * @return
  *         - ESP_OK: 成功
+ *         - ESP_ERR_INVALID_STATE: 服务正在执行其它生命周期操作
+ *         - ESP_ERR_TIMEOUT: 等待互斥量超时
+ *         - 其他: 事件处理器注销失败，句柄未释放
  */
 esp_err_t metering_service_destroy(metering_service_t *me);
 

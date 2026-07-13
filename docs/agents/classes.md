@@ -1819,10 +1819,16 @@ struct thingsboard_client {
     int json_buf_size;
     tb_command_cb_t cmd_cb;
     void *cmd_ctx;
+    uint32_t active_cmd_callbacks;
     bool started;
+    bool stopping;
     bool destroying;
+    bool network_rx_registered;
+    bool cleanup_pending;
 };
 ```
+
+销毁采用非消费式失败语义：仅 `thingsboard_client_destroy()` 返回 `ESP_OK` 时句柄才被释放。停止失败时通过 `network_rx_registered` / `cleanup_pending` 保留未完成的清理状态；后续重试继续执行必要的 network_manager 回调清除和取消订阅。命令回调 drain 超时后同样保留对象，供调用方重试 destroy。
 
 ### 13.6 TB Topic 约定
 
@@ -1897,7 +1903,6 @@ typedef struct {
     gpio_num_t en_gpio;
     // Network
     const char *apn;
-    bool auto_connect;
     // MQTT
     bool mqtt_enabled;
     const char *mqtt_broker_host;
@@ -1923,7 +1928,7 @@ typedef struct {
 
 ```c
 typedef struct {
-    char topic[LTE_LINK_MAX_TOPIC_LEN];
+    char *topic;
     network_mqtt_qos_t qos;
     bool in_use;
 } lte_link_sub_entry_t;
@@ -1931,17 +1936,24 @@ typedef struct {
 struct lte_link {
     network_link_t base;
     lte_link_config_t config;
-    lwlte_t *lwlte;
+    char *apn;
+    char *mqtt_broker_host;
+    char *mqtt_client_id;
+    char *mqtt_username;
+    char *mqtt_password;
+    lwlte_handle_t lwlte;
     // 订阅表
     lte_link_sub_entry_t *sub_table;
     int sub_table_size;
+    int max_topic_len;
     // 线程安全
     SemaphoreHandle_t mutex;
     // 下行回调
     network_rx_cb_t rx_cb;
     void *rx_ctx;
-    // 状态缓存
-    network_link_status_t cached_status;
+    int active_rx_callbacks;
+    esp_event_handler_instance_t net_handler;
+    esp_event_handler_instance_t mqtt_handler;
     // 状态
     bool started;
     bool destroying;
@@ -1956,20 +1968,21 @@ struct lte_link {
 network_link_t *lte_link_create(const lte_link_config_t *config);
 ```
 
-`lte_link_create()` 内部调用 `lwlte_air780ep_init()`，**阻塞**直到 esp-lwlte ready（AT Engine + Modem + Core 初始化完成），然后返回 `network_link_t *`。
+`lte_link_create()` 内部调用 `lwlte_air780ep_init()` 创建门面对象，不启动模组、不等待 AT ready、不激活 PDP，然后返回 `network_link_t *`。
 
 **ops 实现映射**：
 
 | ops 方法 | 实现要点 |
 |----------|----------|
 | `destroy` | 停止链路 → `lwlte_destroy(lwlte)` → 释放 sub_table → 释放自身 |
-| `start` | `lwlte_connect(lwlte)`；若 `mqtt_enabled` → `lwlte_mqtt_start(lwlte)` |
-| `stop` | 停止 MQTT → 断开网络 → 保留 lwlte 句柄可重 start |
+| `start` | `lwlte_start(lwlte)` 异步启动 LTE 网络；不在此处启动 MQTT |
+| `stop` | 注销事件处理器 → `lwlte_stop(lwlte)` 异步停止网络，保留 lwlte 句柄可重 start |
 | `get_status` | 从 `lwlte_get_state()` / `lwlte_mqtt_get_state()` 映射到 `network_link_status_t` |
 | `publish` | `lwlte_mqtt_publish(lwlte, topic, payload, len, qos, retain)` |
 | `subscribe` | 写入自身订阅表 → `lwlte_mqtt_subscribe(lwlte, topic, qos)` |
 | `unsubscribe` | 从订阅表移除 → `lwlte_mqtt_unsubscribe(lwlte, topic)` |
 | `register_rx_cb` | 保存回调 → lwlte 事件 `LWLTE_EVENT_MQTT_DATA` 时调用 |
+| `set_active` | `true` 调用 `lwlte_mqtt_start()`，`false` 调用 `lwlte_mqtt_stop()`；备链路保持网络值守 |
 
 ### 14.5 状态映射
 
@@ -1981,26 +1994,25 @@ STARTING                   → STARTING
 READY / NET_ACTIVATING     → CONNECTING
 ONLINE + MQTT_STOPPED      → DEGRADED
 ONLINE + MQTT_CONNECTED    → READY
-ERROR                      → ERROR
+ERROR / DESTROYING         → ERROR
 ```
 
 ### 14.6 lwlte 事件处理流
 
 ```
-lwlte event callback (在 esp-lwlte 内部任务上下文)
-    │  LWLTE_EVENT_NET_ONLINE    → 更新状态
-    │  LWLTE_EVENT_NET_OFFLINE   → 更新状态 → 尝试重连
-    │  LWLTE_EVENT_MQTT_CONNECTED → 遍历 sub_table 重放订阅
-    │  LWLTE_EVENT_MQTT_DATA     → 构造 network_rx_data_t → 调用 rx_cb
-    │  LWLTE_EVENT_ERROR         → 更新状态为 ERROR
+默认 esp_event loop handler
+    │  LWLTE_EVENT_NET_ONLINE       → 记录网络在线
+    │  LWLTE_EVENT_NET_OFFLINE      → 记录网络离线
+    │  LWLTE_MQTT_EVENT_CONNECTED   → 遍历 sub_table 重放订阅
+    │  LWLTE_MQTT_EVENT_DATA        → 构造 network_rx_data_t → 调用 rx_cb → release payload
+    │  LWLTE_EVENT_ERROR            → 记录网络错误
 ```
 
 ### 14.7 关键设计决策
 
-- `lte_link_create()` 阻塞直到 esp-lwlte 初始化完成（AT Engine + Modem + Core ready），失败返回 NULL
+- `lte_link_create()` 只创建 esp-lwlte 门面对象；`start()` 异步启动网络，`set_active(true)` 单独启动 MQTT
 - `lte_link` 维护自己的订阅表，因为 esp-lwlte 的 MQTT subscribe 不记住订阅意图，重连后需 lte_link 重放
 - 配置中大量 esp-lwlte 调优参数（`at_rx_buf_size`、`modem_event_queue_size` 等）不暴露，内部填 0 使用 esp-lwlte 默认值
-- `auto_connect=true` 时 `create` 即提交联网请求；`false` 时由 `start()` 触发
 - esp-lwlte 通过 `EXTRA_COMPONENT_DIRS` 指向 `/Users/jovisdreams/Projects/esp-lwlte`
 
 ---

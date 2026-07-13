@@ -43,6 +43,7 @@
 #define WIFI_LINK_MAX_SSID_LEN              (32)
 #define WIFI_LINK_MAX_PASSWORD_LEN          (64)
 #define WIFI_LINK_RUNTIME_DRAIN_POLL_MS     (10)
+#define WIFI_LINK_RUNTIME_DRAIN_TIMEOUT_MS  (5000U)
 
 /**********************
  *      TYPEDEFS
@@ -1237,6 +1238,8 @@ static void wifi_link_end_runtime_action(wifi_link_t *me)
 
 static esp_err_t wifi_link_wait_runtime_actions_drained(wifi_link_t *me)
 {
+    uint32_t waited_ms = 0U;
+
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
@@ -1253,7 +1256,13 @@ static esp_err_t wifi_link_wait_runtime_actions_drained(wifi_link_t *me)
         if (runtime_action_count == 0) {
             return ESP_OK;
         }
+        if (waited_ms >= WIFI_LINK_RUNTIME_DRAIN_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "wait for runtime actions timed out: active=%d",
+                     runtime_action_count);
+            return ESP_ERR_TIMEOUT;
+        }
         vTaskDelay(pdMS_TO_TICKS(WIFI_LINK_RUNTIME_DRAIN_POLL_MS));
+        waited_ms += WIFI_LINK_RUNTIME_DRAIN_POLL_MS;
     }
 }
 

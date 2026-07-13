@@ -76,9 +76,12 @@ app_controller_t *app_controller_create(const app_controller_config_t *config);
  * @brief 销毁应用控制器
  * @details Destroy app controller
  * @note 本函数不会销毁配置中借用的模块句柄； This function never destroys borrowed module handles.
+ * @note 仅 ESP_OK 表示句柄已被释放；失败时句柄仍归调用方所有，只能在外部串行化后重试 stop/destroy。
+ *       Only ESP_OK consumes the handle; on failure the caller retains ownership and may retry stop/destroy after external serialization.
  * @param[in] me 应用控制器句柄，可为 NULL； App controller handle, may be NULL
  * @return
  *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_TIMEOUT: 生命周期操作等待超时； Lifecycle operation timed out
  *         - 其他: 停止失败； Stop failed
  */
 esp_err_t app_controller_destroy(app_controller_t *me);
@@ -104,6 +107,7 @@ esp_err_t app_controller_start(app_controller_t *me);
  *         - ESP_OK: 成功或已停止； Success or already stopped
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待启动或互斥量超时； Start completion or mutex timeout
  *         - 其他: 下层模块停止或回调清理失败； Lower module stop or callback cleanup failed
  */
 esp_err_t app_controller_stop(app_controller_t *me);

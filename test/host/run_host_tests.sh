@@ -17,6 +17,15 @@ mkdir -p "${BUILD_DIR}"
 "${BUILD_DIR}/test_thingsboard_client_internal"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/main/network" \
+    -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/thingsboard" \
+    "${ROOT_DIR}/test/host/test_thingsboard_client_lifecycle.c" \
+    -o "${BUILD_DIR}/test_thingsboard_client_lifecycle"
+
+"${BUILD_DIR}/test_thingsboard_client_lifecycle"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/network/lte" \
     "${ROOT_DIR}/main/network/lte/lte_link_internal.c" \

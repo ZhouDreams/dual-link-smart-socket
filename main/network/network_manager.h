@@ -83,10 +83,14 @@ network_manager_t *network_manager_create(const network_manager_config_t *config
 /**
  * @brief 销毁双模网络管理器
  * @details Destroy dual-mode network manager
+ * @note 仅 ESP_OK 表示句柄已被释放；失败时监控任务或链路回调可能仍引用句柄，调用方须保留借用链路并重试 destroy。
+ *       Only ESP_OK consumes the handle; on failure a monitor task or link callback may still reference it, so borrowed links must remain alive and destroy must be retried.
  * @param[in] me 双模网络管理器句柄； Dual-mode network manager handle
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ *         - ESP_ERR_TIMEOUT: 等待监控任务或回调退出超时； Monitor task or callback drain timed out
+ *         - 其他: 下层链路停止或回调清理失败，句柄未释放； Lower link cleanup failed and the handle remains owned
  */
 esp_err_t network_manager_destroy(network_manager_t *me);
 
@@ -98,6 +102,7 @@ esp_err_t network_manager_destroy(network_manager_t *me);
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待互斥量超时； Mutex timeout
  */
 esp_err_t network_manager_start(network_manager_t *me);
 
@@ -109,6 +114,7 @@ esp_err_t network_manager_start(network_manager_t *me);
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
  *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_TIMEOUT: 等待监控任务或互斥量超时； Monitor task or mutex timeout
  */
 esp_err_t network_manager_stop(network_manager_t *me);
 
@@ -183,9 +189,12 @@ esp_err_t network_manager_unsubscribe(network_manager_t *me,
  * @param[in] me 双模网络管理器句柄； Dual-mode network manager handle
  * @param[in] cb 下行消息回调； RX message callback
  * @param[in] ctx 用户上下文； User context
+ * @note cb 为 NULL 时，ESP_OK 保证旧回调及 ctx 已不再被使用；ESP_ERR_TIMEOUT 时旧 ctx 必须继续有效。
+ *       When cb is NULL, ESP_OK guarantees the old callback and ctx are no longer used; after ESP_ERR_TIMEOUT the old ctx must remain valid.
  * @return
  *         - ESP_OK: 成功； Success
  *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ *         - ESP_ERR_TIMEOUT: 等待在途回调或互斥量超时； In-flight callback or mutex timeout
  */
 esp_err_t network_manager_register_rx_cb(network_manager_t *me,
                                           network_rx_cb_t cb, void *ctx);

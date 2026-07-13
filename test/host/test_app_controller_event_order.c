@@ -121,6 +121,7 @@ static metering_snapshot_t s_startup_metering_snapshot;
 static esp_event_handler_instance_t s_startup_metering_handler_instance = NULL;
 static bool s_emit_metering_snapshot_during_startup_unregister = false;
 static metering_snapshot_t s_startup_handoff_metering_snapshot;
+static uint32_t s_task_delay_calls = 0U;
 
 static void reset_host_state(void)
 {
@@ -138,6 +139,7 @@ static void reset_host_state(void)
     s_emit_metering_snapshot_during_startup_unregister = false;
     memset(&s_startup_handoff_metering_snapshot, 0,
            sizeof(s_startup_handoff_metering_snapshot));
+    s_task_delay_calls = 0U;
 }
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
@@ -183,6 +185,7 @@ void vSemaphoreDelete(SemaphoreHandle_t mutex)
 void vTaskDelay(TickType_t ticks_to_wait)
 {
     (void)ticks_to_wait;
+    s_task_delay_calls++;
 }
 
 static esp_err_t host_register_handler(bool registered_with_loop,
@@ -1062,12 +1065,42 @@ static void test_start_handoff_race_discards_metering_snapshot_token(void)
     assert(app_controller_destroy(controller) == ESP_OK);
 }
 
+static void test_stop_times_out_while_start_remains_in_progress(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    controller->starting = true;
+
+    assert(app_controller_stop(controller) == ESP_ERR_TIMEOUT);
+    assert(s_task_delay_calls ==
+           APP_CONTROLLER_LIFECYCLE_TIMEOUT_MS /
+               APP_CONTROLLER_LIFECYCLE_POLL_MS);
+    assert(controller->starting == true);
+    assert(controller->stopping == false);
+
+    controller->starting = false;
+    assert(app_controller_destroy(controller) == ESP_OK);
+}
+
 int main(void)
 {
     test_metering_handler_runs_after_safety_handler();
     test_metering_register_failure_rolls_back_handlers();
     test_start_discards_startup_window_energy_delta_token();
     test_start_handoff_race_discards_metering_snapshot_token();
+    test_stop_times_out_while_start_remains_in_progress();
 
     printf("app controller event order tests passed\n");
     return 0;
