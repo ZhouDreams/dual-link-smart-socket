@@ -71,7 +71,6 @@ struct network_manager {
     network_link_t *primary;
     network_link_t *backup;
     network_link_t *active;
-    network_link_type_t preferred_primary;
     uint32_t failover_recheck_ms;
     uint32_t failback_delay_ms;
     network_manager_sub_entry_t *sub_table;
@@ -808,16 +807,23 @@ static esp_err_t network_manager_validate_config(
 static void network_manager_apply_config(const network_manager_config_t *config,
                                          network_manager_t *me)
 {
+    network_link_type_t preferred_primary = NETWORK_LINK_TYPE_NONE;
+
     if (config == NULL || me == NULL) {
         return;
     }
 
     me->primary = config->primary;
     me->backup = config->backup;
-    me->preferred_primary = (config->preferred_primary ==
-                             NETWORK_LINK_TYPE_NONE) ?
+    preferred_primary = (config->preferred_primary == NETWORK_LINK_TYPE_NONE) ?
                             network_link_get_type(config->primary) :
                             config->preferred_primary;
+    if (config->backup != NULL &&
+        preferred_primary != network_link_get_type(config->primary) &&
+        preferred_primary == network_link_get_type(config->backup)) {
+        me->primary = config->backup;
+        me->backup = config->primary;
+    }
     me->failover_recheck_ms = (config->failover_recheck_ms == 0U) ?
                               NETWORK_MANAGER_DEFAULT_RECHECK_MS :
                               config->failover_recheck_ms;

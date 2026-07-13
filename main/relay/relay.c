@@ -35,6 +35,8 @@ struct relay {
     relay_active_level_t active_level;
     bool on;
     SemaphoreHandle_t mutex;
+    relay_source_t pending_source;
+    bool event_pending;
     bool initialized;
 };
 
@@ -66,8 +68,9 @@ static uint32_t relay_logical_to_level(const relay_t *me, bool on);
  * @details Post state changed event
  * @param[in] on 继电器状态； Relay state
  * @param[in] source 操作来源； Operation source
+ * @return ESP-IDF 错误码； ESP-IDF error code
  */
-static void relay_post_state_changed(bool on, relay_source_t source);
+static esp_err_t relay_post_state_changed(bool on, relay_source_t source);
 
 /**********************
  *  STATIC VARIABLES
@@ -181,7 +184,12 @@ esp_err_t relay_set(relay_t *me, relay_source_t source, bool on)
     if (ret == ESP_OK) {
         me->on = on;
         if (previous_on != on) {
-            relay_post_state_changed(on, source);
+            me->pending_source = source;
+            me->event_pending = true;
+        }
+        if (me->event_pending &&
+            relay_post_state_changed(me->on, me->pending_source) == ESP_OK) {
+            me->event_pending = false;
         }
     }
 
@@ -213,7 +221,11 @@ esp_err_t relay_toggle(relay_t *me, relay_source_t source)
                                    relay_logical_to_level(me, new_on));
     if (ret == ESP_OK) {
         me->on = new_on;
-        relay_post_state_changed(new_on, source);
+        me->pending_source = source;
+        me->event_pending = true;
+        if (relay_post_state_changed(new_on, source) == ESP_OK) {
+            me->event_pending = false;
+        }
     }
 
     (void)xSemaphoreGive(me->mutex);
@@ -268,7 +280,7 @@ static uint32_t relay_logical_to_level(const relay_t *me, bool on)
     return (on == active_high) ? 1U : 0U;
 }
 
-static void relay_post_state_changed(bool on, relay_source_t source)
+static esp_err_t relay_post_state_changed(bool on, relay_source_t source)
 {
     const relay_state_changed_event_t event = {
         .on = on,
@@ -282,4 +294,5 @@ static void relay_post_state_changed(bool on, relay_source_t source)
         ESP_LOGW(TAG, "post state changed event failed: %s",
                  esp_err_to_name(ret));
     }
+    return ret;
 }

@@ -21,6 +21,8 @@ typedef struct {
 #define GPIO_NUM_NC (-1)
 
 #define GPIO_IS_VALID_OUTPUT_GPIO(gpio) ((gpio) >= 0 && (gpio) <= 48)
+#define GPIO_IS_VALID_GPIO(gpio) ((gpio) >= 0 && (gpio) <= 48)
 
 esp_err_t gpio_config(const gpio_config_t *config);
 esp_err_t gpio_set_level(gpio_num_t gpio_num, uint32_t level);
+esp_err_t gpio_reset_pin(gpio_num_t gpio_num);

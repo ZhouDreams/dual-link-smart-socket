@@ -41,6 +41,8 @@ typedef struct network_link network_link_t;
  * @details Destroy network link
  * @note 仅 ESP_OK 表示句柄已被释放；任何错误返回都保留句柄所有权，调用方不得释放其内存。
  *       Only ESP_OK consumes the handle; any error preserves caller ownership and the caller must not free its memory.
+ * @note 调用方必须在外部串行化 destroy 与同一句柄的所有其它访问，包括另一次 destroy。
+ *       The caller must externally serialize destroy against every other access to the same handle, including another destroy.
  * @param[in] me 网络链路句柄； Network link handle
  * @return
  *         - ESP_OK: 成功； Success

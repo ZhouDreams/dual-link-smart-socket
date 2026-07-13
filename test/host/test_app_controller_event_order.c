@@ -113,6 +113,8 @@ static size_t s_handler_count = 0U;
 static const char *s_dispatch_trace[8];
 static size_t s_dispatch_trace_count = 0U;
 static int s_publish_telemetry_calls = 0;
+static bool s_last_telemetry_relay_on = false;
+static bool s_last_telemetry_relay_known = false;
 static bool s_fail_late_app_metering_register = false;
 static unsigned int s_metering_register_count = 0U;
 static esp_event_handler_t s_last_failed_metering_handler = NULL;
@@ -130,6 +132,8 @@ static void reset_host_state(void)
     memset(s_dispatch_trace, 0, sizeof(s_dispatch_trace));
     s_dispatch_trace_count = 0U;
     s_publish_telemetry_calls = 0;
+    s_last_telemetry_relay_on = false;
+    s_last_telemetry_relay_known = false;
     s_fail_late_app_metering_register = false;
     s_metering_register_count = 0U;
     s_last_failed_metering_handler = NULL;
@@ -387,8 +391,13 @@ static void host_test_safety_metering_handler(void *handler_args,
     guard->latest.level = (snapshot != NULL && snapshot->power > 1000.0f) ?
                               SAFETY_GUARD_LEVEL_DANGER :
                               SAFETY_GUARD_LEVEL_NORMAL;
-    guard->latest.event = SAFETY_GUARD_EVENT_NONE;
-    guard->latest.suggested_action = SAFETY_GUARD_ACTION_NONE;
+    guard->latest.event = (guard->latest.level == SAFETY_GUARD_LEVEL_DANGER) ?
+                              SAFETY_GUARD_EVENT_OVERPOWER :
+                              SAFETY_GUARD_EVENT_NONE;
+    guard->latest.suggested_action =
+        (guard->latest.level == SAFETY_GUARD_LEVEL_DANGER) ?
+            SAFETY_GUARD_ACTION_RELAY_OFF :
+            SAFETY_GUARD_ACTION_NONE;
     guard->latest.timestamp_us = (snapshot != NULL) ? snapshot->timestamp_us : 0U;
     guard->latest.valid = true;
 }
@@ -451,12 +460,13 @@ esp_err_t relay_get(const relay_t *me, bool *out_on)
 
 esp_err_t relay_set(relay_t *me, relay_source_t source, bool on)
 {
-    (void)source;
-
     if (me == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (source == RELAY_SOURCE_SAFETY && !on) {
+        s_dispatch_trace[s_dispatch_trace_count++] = "relay_off";
+    }
     me->on = on;
     return ESP_OK;
 }
@@ -701,6 +711,8 @@ esp_err_t thingsboard_client_publish_telemetry(thingsboard_client_t *me,
     assert(input != NULL);
     s_dispatch_trace[s_dispatch_trace_count++] = "app";
     s_publish_telemetry_calls++;
+    s_last_telemetry_relay_on = input->relay_on;
+    s_last_telemetry_relay_known = true;
     return ESP_OK;
 }
 
@@ -907,6 +919,49 @@ static void test_metering_handler_runs_after_safety_handler(void)
     assert(app_controller_destroy(controller) == ESP_OK);
 }
 
+static void test_metering_handler_applies_safety_action_without_safety_event(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+    const metering_snapshot_t snapshot = {
+        .voltage = 230.0f,
+        .current = 6.0f,
+        .power = 1380.0f,
+        .frequency = 50.0f,
+        .timestamp_us = 2345U,
+        .valid = true,
+    };
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    assert(app_controller_start(controller) == ESP_OK);
+
+    /* The safety stub updates latest but deliberately emits no safety event. */
+    dispatch_event(METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+                   (void *)&snapshot);
+
+    assert(relay.on == false);
+    assert(s_publish_telemetry_calls == 1);
+    assert(s_last_telemetry_relay_known == true);
+    assert(s_last_telemetry_relay_on == false);
+    assert(s_dispatch_trace_count == 3U);
+    assert(strcmp(s_dispatch_trace[0], "safety") == 0);
+    assert(strcmp(s_dispatch_trace[1], "relay_off") == 0);
+    assert(strcmp(s_dispatch_trace[2], "app") == 0);
+
+    assert(app_controller_stop(controller) == ESP_OK);
+    assert(app_controller_destroy(controller) == ESP_OK);
+}
+
 static void test_metering_register_failure_rolls_back_handlers(void)
 {
     relay_t relay = {0};
@@ -1097,6 +1152,7 @@ static void test_stop_times_out_while_start_remains_in_progress(void)
 int main(void)
 {
     test_metering_handler_runs_after_safety_handler();
+    test_metering_handler_applies_safety_action_without_safety_event();
     test_metering_register_failure_rolls_back_handlers();
     test_start_discards_startup_window_energy_delta_token();
     test_start_handoff_race_discards_metering_snapshot_token();

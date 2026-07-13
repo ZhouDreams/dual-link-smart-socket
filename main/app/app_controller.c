@@ -88,6 +88,13 @@ static void app_controller_on_safety_snapshot(void *handler_args,
                                               void *event_data);
 
 /**
+ * @brief 应用安全快照建议动作
+ * @details Apply the suggested action from a safety snapshot
+ */
+static void app_controller_apply_safety_action(
+    app_controller_t *me, const safety_guard_snapshot_t *snapshot);
+
+/**
  * @brief 处理电参量快照事件
  * @details Handle metering snapshot event
  */
@@ -546,11 +553,27 @@ static void app_controller_on_safety_snapshot(void *handler_args,
         return;
     }
 
-    if (snapshot->suggested_action == SAFETY_GUARD_ACTION_RELAY_OFF) {
-        esp_err_t ret = relay_set(me->cfg.relay, RELAY_SOURCE_SAFETY, false);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "safety relay off failed: %s", esp_err_to_name(ret));
-        }
+    app_controller_apply_safety_action(me, snapshot);
+}
+
+static void app_controller_apply_safety_action(
+    app_controller_t *me, const safety_guard_snapshot_t *snapshot)
+{
+    if (me == NULL || snapshot == NULL || !snapshot->valid ||
+        snapshot->suggested_action != SAFETY_GUARD_ACTION_RELAY_OFF) {
+        return;
+    }
+
+    const esp_err_t ret = relay_set(me->cfg.relay, RELAY_SOURCE_SAFETY, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "safety relay off failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+        me->relay_on = false;
+        me->relay_known = true;
+        (void)xSemaphoreGive(me->mutex);
     }
 }
 
@@ -561,7 +584,9 @@ static void app_controller_on_metering_snapshot(void *handler_args,
 {
     app_controller_t *me = (app_controller_t *)handler_args;
     metering_snapshot_t *snapshot = (metering_snapshot_t *)event_data;
+    safety_guard_snapshot_t safety_snapshot = {0};
     bool app_owns_startup_discard = true;
+    esp_err_t ret = ESP_OK;
 
     if (event_base != METERING_EVENT_BASE || event_id != METERING_EVENT_SNAPSHOT ||
         snapshot == NULL || me == NULL) {
@@ -579,7 +604,15 @@ static void app_controller_on_metering_snapshot(void *handler_args,
         return;
     }
 
-    esp_err_t ret = app_controller_publish_telemetry(me, snapshot);
+    ret = safety_guard_get_latest(me->cfg.safety, &safety_snapshot);
+    if (ret == ESP_OK) {
+        app_controller_apply_safety_action(me, &safety_snapshot);
+    } else if (ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "get latest safety snapshot failed: %s",
+                 esp_err_to_name(ret));
+    }
+
+    ret = app_controller_publish_telemetry(me, snapshot);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "publish telemetry failed: %s", esp_err_to_name(ret));
     }

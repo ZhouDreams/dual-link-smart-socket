@@ -45,6 +45,8 @@ typedef struct network_manager network_manager_t;
  * @note preferred_primary 必须为 NETWORK_LINK_TYPE_NONE 以默认使用 primary 的类型，或匹配注入链路之一的类型；不匹配视为无效配置。
  *       preferred_primary must be NETWORK_LINK_TYPE_NONE to default to the primary link type, or match one of the
  *       injected link types; mismatches are invalid configuration.
+ * @note create 会按 preferred_primary 规范化内部主备顺序；聚合状态中的 primary_status 表示规范化后的首选链路。
+ *       create normalizes the internal link order using preferred_primary; primary_status describes the normalized preferred link.
  */
 typedef struct {
     network_link_t *primary;                  /**< 借用的主链路； Borrowed primary link */

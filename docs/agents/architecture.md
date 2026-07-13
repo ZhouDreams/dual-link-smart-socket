@@ -77,7 +77,7 @@
 4. `metering_service_t *`
 5. `safety_guard_t *`
 6. `thingsboard_client_t *`
-7. `display_service_t *`
+7. `lvgl_dashboard_t *`
 
 这些模块没有自然的子类关系，使用句柄封装即可，避免过度设计。
 
@@ -112,8 +112,8 @@
                                ▼
 ┌────────────────────────────────────────────────────────────┐
 │ 业务服务层                                                  │
-│ metering_service / safety_guard / thingsboard_client / display_service │
-│ 电参量聚合、安全规则、云平台语义、本地显示状态模型            │
+│ metering_service / safety_guard / thingsboard_client             │
+│ 电参量聚合、安全规则、云平台语义                                 │
 └──────────────────────────────┬─────────────────────────────┘
                                │
                                ▼
@@ -163,7 +163,6 @@
 1. `metering_service`
 2. `safety_guard`
 3. `thingsboard_client`
-4. `display_service`
 
 #### `metering_service`
 
@@ -218,22 +217,6 @@
 1. `thingsboard_client` 只依赖 `network_manager` 提供的统一通道。
 2. `thingsboard_client` 不直接依赖 `wifi_link` 或 `lte_link`。
 3. `thingsboard_client` 不直接操作继电器，而是把语义命令回调给 `app_controller`。
-
-#### `display_service`
-
-职责：
-
-1. 汇总系统状态为统一的 `display_snapshot_t`。
-2. 接收电参量、继电器状态、网络状态、安全状态。
-3. 将快照提交给 `lvgl_dashboard`。
-4. 管理屏幕开关状态。
-
-不负责：
-
-1. 直接读取 BL0942。
-2. 直接控制继电器。
-3. 直接发布云端遥测。
-4. 在非 LVGL 任务上下文中更新 widget。
 
 ### 3.3 网络抽象层
 
@@ -525,18 +508,18 @@ network_manager_t *net_mgr = network_manager_create(&net_config);
 
 `LVGL` 是本项目主干能力，不是可选边角功能。
 
-显示路径由两个模块组成：
+显示路径由两个驱动适配模块组成：
 
-1. `display_service`
-2. `lvgl_dashboard` / `tft_panel`
+1. `lvgl_dashboard`
+2. `tft_panel`
 
-`display_service` 面向业务状态，`lvgl_dashboard` 面向 UI 控件，`tft_panel` 面向 LCD 硬件。
+`lvgl_dashboard` 直接订阅业务事件、缓存显示状态并在 LVGL task 中更新控件；`tft_panel` 面向 LCD 硬件。
 
 依赖关系：
 
 ```text
 metering_service ─┐
-relay             ├─→ display_service → lvgl_dashboard → tft_panel
+relay             ├─→ lvgl_dashboard → tft_panel
 network_manager ──┤
 safety_guard ─────┘
 ```
@@ -544,7 +527,7 @@ safety_guard ─────┘
 设计规则：
 
 1. 非 LVGL 任务不得直接操作 widget。
-2. 上层只提交显示快照。
+2. 业务事件 handler 只更新 `lvgl_dashboard` 的状态缓存。
 3. LVGL 任务内部读取最新快照并更新控件。
 4. 关闭屏幕优先表现为背光关闭，不影响系统主逻辑运行。
 
@@ -611,7 +594,7 @@ app_controller
   │
   ├─ 单击 → relay_toggle(LOCAL_BUTTON)
   │
-  └─ 长按 → display_service_set_screen_enabled(...)
+  └─ 长按 → lvgl_dashboard_set_screen_enabled(...)
 ```
 
 本地按键必须在网络不可用时仍然可用。
@@ -623,18 +606,21 @@ metering_service
   │  metering_snapshot_t
   ▼
 safety_guard
-  │  safety_snapshot_t + suggested_action
+  │  更新 latest + 广播 safety_snapshot_t
+  ├──────────────────────────────┐
+  │                              ▼
+  │                    lvgl_dashboard 等事件消费者
   ▼
-app_controller
-  │  action == RELAY_OFF
+app_controller 的后置 metering handler
+  │  safety_guard_get_latest()，action == RELAY_OFF
   ▼
 relay_set(SAFETY, false)
   │
-  ├─ relay event → display_service
+  ├─ relay event → lvgl_dashboard
   └─ relay event → thingsboard_client 上报状态
 ```
 
-安全保护必须是本地闭环，不依赖 ThingsBoard 在线状态。
+`safety_guard` 的计量 handler 先执行，`app_controller` 随后直接读取 latest 并执行动作，因此继电器关断不依赖 safety 事件再次入队成功。安全保护必须是本地闭环，不依赖 ThingsBoard 在线状态。
 
 ### 6.5 显示刷新流
 
@@ -645,10 +631,8 @@ network status
 safety snapshot
   │
   ▼
-display_service
-  │  display_snapshot_t
-  ▼
 lvgl_dashboard
+  │  event handler 更新 state_cache
   │  LVGL task 内部更新 widget
   ▼
 tft_panel
@@ -703,7 +687,6 @@ tft_panel
 | `metering_service` | `bl0942` 事件和公共类型 |
 | `safety_guard` | `metering_service` 输出类型 |
 | `thingsboard_client` | `network_manager`、业务输入类型 |
-| `display_service` | 业务快照类型、`lvgl_dashboard` |
 | `network_manager` | `network_link` 基类 API |
 | `wifi_link` | `network_link`、ESP Wi-Fi、esp-mqtt |
 | `lte_link` | `network_link`、esp-lwlte |

@@ -13,6 +13,7 @@ typedef void *esp_event_handler_instance_t;
 
 #define ESP_EVENT_DECLARE_BASE(id) extern esp_event_base_t id
 #define ESP_EVENT_DEFINE_BASE(id) esp_event_base_t id = #id
+#define ESP_EVENT_ANY_ID (-1)
 
 esp_err_t esp_event_post(esp_event_base_t event_base, int32_t event_id,
                          const void *event_data, size_t event_data_size,

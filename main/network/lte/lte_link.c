@@ -63,10 +63,12 @@ typedef struct lte_link {
     network_rx_cb_t rx_cb;
     void *rx_ctx;
     int active_rx_callbacks;
+    int active_ops;
     esp_event_handler_instance_t net_handler;
     esp_event_handler_instance_t mqtt_handler;
     bool started;
     bool destroying;
+    bool destroy_in_progress;
 } lte_link_t;
 
 /**********************
@@ -90,6 +92,10 @@ static esp_err_t lte_link_register_rx_cb_impl(network_link_t *base,
 static esp_err_t lte_link_set_active_impl(network_link_t *base, bool active);
 
 static esp_err_t lte_link_wait_rx_callbacks_drained(lte_link_t *me);
+static esp_err_t lte_link_wait_destroy_activity_drained(lte_link_t *me);
+static esp_err_t lte_link_begin_op(lte_link_t *me, lwlte_handle_t *out_lwlte);
+static void lte_link_end_op(lte_link_t *me);
+static void lte_link_mark_destroy_failed(lte_link_t *me);
 static esp_err_t lte_link_validate_config(const lte_link_config_t *config);
 static esp_err_t lte_link_copy_config(lte_link_t *me,
                                       const lte_link_config_t *config);
@@ -200,18 +206,32 @@ static esp_err_t lte_link_destroy_impl(network_link_t *base)
     }
 
     lte_link_t *me = lte_link_from_base(base);
-    if (me->mutex != NULL && xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
-        me->destroying = true;
-        me->rx_cb = NULL;
-        me->rx_ctx = NULL;
-        lwlte = me->lwlte;
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    if (me->destroy_in_progress) {
         (void)xSemaphoreGive(me->mutex);
+        return ESP_ERR_INVALID_STATE;
     }
+    me->destroying = true;
+    me->destroy_in_progress = true;
+    lwlte = me->lwlte;
+    (void)xSemaphoreGive(me->mutex);
 
-    ret = lte_link_wait_rx_callbacks_drained(me);
+    ret = lte_link_wait_destroy_activity_drained(me);
     if (ret != ESP_OK) {
+        lte_link_mark_destroy_failed(me);
         return ret;
     }
+
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        lte_link_mark_destroy_failed(me);
+        return ESP_ERR_TIMEOUT;
+    }
+    me->rx_cb = NULL;
+    me->rx_ctx = NULL;
+    (void)xSemaphoreGive(me->mutex);
 
     /* Unregister events before powering off so no callback fires into a
      * half-torn-down object. */
@@ -226,7 +246,9 @@ static esp_err_t lte_link_destroy_impl(network_link_t *base)
     if (lwlte != NULL) {
         ret = lwlte_destroy(lwlte);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "lwlte destroy failed: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "lwlte destroy failed: %s", esp_err_to_name(ret));
+            lte_link_mark_destroy_failed(me);
+            return ret;
         }
         me->lwlte = NULL;
     }
@@ -249,22 +271,22 @@ static esp_err_t lte_link_destroy_impl(network_link_t *base)
 static esp_err_t lte_link_start_impl(network_link_t *base)
 {
     esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
     bool already_started = false;
 
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(me->lwlte != NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "link is not initialized");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
-    if (me->destroying) {
-        (void)xSemaphoreGive(me->mutex);
-        return ESP_ERR_INVALID_STATE;
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE start failed");
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        lte_link_end_op(me);
+        return ESP_ERR_TIMEOUT;
     }
     already_started = me->started;
     if (already_started) {
         (void)xSemaphoreGive(me->mutex);
+        lte_link_end_op(me);
         return ESP_OK;
     }
     me->started = true;  /* claim started so events/callbacks see it */
@@ -277,13 +299,14 @@ static esp_err_t lte_link_start_impl(network_link_t *base)
 
     /* Async network bring-up (registration + PDP). Returns OK = submitted.
      * Status progresses to DEGRADED once online (observed via get_status). */
-    ret = lwlte_start(me->lwlte);
+    ret = lwlte_start(lwlte);
     if (ret != ESP_OK) {
         lte_link_unregister_events(me);
         goto revert_started;
     }
 
     ESP_LOGI(TAG, "lwlte start submitted");
+    lte_link_end_op(me);
     return ESP_OK;
 
 revert_started:
@@ -291,29 +314,34 @@ revert_started:
         me->started = false;
         (void)xSemaphoreGive(me->mutex);
     }
+    lte_link_end_op(me);
     return ret;
 }
 
 static esp_err_t lte_link_stop_impl(network_link_t *base)
 {
     esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
 
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(me->lwlte != NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "link is not initialized");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE stop failed");
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        lte_link_end_op(me);
+        return ESP_ERR_TIMEOUT;
+    }
     if (!me->started) {
         (void)xSemaphoreGive(me->mutex);
+        lte_link_end_op(me);
         return ESP_OK;
     }
     (void)xSemaphoreGive(me->mutex);
 
     lte_link_unregister_events(me);
 
-    ret = lwlte_stop(me->lwlte);  /* async: stop MQTT + deactivate PDP + EN off */
+    ret = lwlte_stop(lwlte);  /* async: stop MQTT + deactivate PDP + EN off */
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "lwlte stop failed: %s", esp_err_to_name(ret));
     }
@@ -322,21 +350,32 @@ static esp_err_t lte_link_stop_impl(network_link_t *base)
         me->started = false;
         (void)xSemaphoreGive(me->mutex);
     }
+    lte_link_end_op(me);
     return ESP_OK;
 }
 
 static esp_err_t lte_link_get_status_impl(network_link_t *base,
                                           network_link_status_t *out)
 {
+    esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
+
     ESP_RETURN_ON_FALSE(base != NULL && out != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "invalid argument");
     lte_link_t *me = lte_link_from_base(base);
-    return lte_link_query_status(me, out);
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE status query failed");
+    (void)lwlte;
+    ret = lte_link_query_status(me, out);
+    lte_link_end_op(me);
+    return ret;
 }
 
 static esp_err_t lte_link_publish_impl(network_link_t *base,
                                        const network_publish_request_t *req)
 {
+    esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
     network_link_status_t status = NETWORK_LINK_STATUS_IDLE;
 
     ESP_RETURN_ON_FALSE(base != NULL && req != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -349,16 +388,28 @@ static esp_err_t lte_link_publish_impl(network_link_t *base,
                         ESP_ERR_INVALID_ARG, TAG, "invalid qos");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(me->config.mqtt_enabled, ESP_ERR_NOT_SUPPORTED, TAG,
-                        "mqtt is disabled");
-    ESP_RETURN_ON_ERROR(lte_link_query_status(me, &status), TAG,
-                        "query status failed");
-    ESP_RETURN_ON_FALSE(status == NETWORK_LINK_STATUS_READY,
-                        ESP_ERR_INVALID_STATE, TAG, "mqtt is not ready");
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE publish failed");
+    if (!me->config.mqtt_enabled) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto out;
+    }
+    ret = lte_link_query_status(me, &status);
+    if (ret != ESP_OK) {
+        goto out;
+    }
+    if (status != NETWORK_LINK_STATUS_READY) {
+        ret = ESP_ERR_INVALID_STATE;
+        goto out;
+    }
 
-    return lwlte_mqtt_publish(me->lwlte, req->topic,
-                              (const uint8_t *)req->payload, req->payload_len,
-                              (uint8_t)req->qos, req->retain);
+    ret = lwlte_mqtt_publish(lwlte, req->topic,
+                             (const uint8_t *)req->payload, req->payload_len,
+                             (uint8_t)req->qos, req->retain);
+
+out:
+    lte_link_end_op(me);
+    return ret;
 }
 
 static esp_err_t lte_link_subscribe_impl(network_link_t *base,
@@ -366,6 +417,7 @@ static esp_err_t lte_link_subscribe_impl(network_link_t *base,
                                          network_mqtt_qos_t qos)
 {
     esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
     bool broker_io = false;
 
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
@@ -375,21 +427,30 @@ static esp_err_t lte_link_subscribe_impl(network_link_t *base,
                         TAG, "invalid qos");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(me->config.mqtt_enabled, ESP_ERR_NOT_SUPPORTED, TAG,
-                        "mqtt is disabled");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE subscribe failed");
+    if (!me->config.mqtt_enabled) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto out;
+    }
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto out;
+    }
     ret = lte_link_internal_store_subscription(me->sub_table, me->sub_table_size,
                                                topic, qos, me->max_topic_len);
-    broker_io = (ret == ESP_OK) && !me->destroying;
+    broker_io = (ret == ESP_OK);
     (void)xSemaphoreGive(me->mutex);
     if (ret != ESP_OK) {
-        return ret;
+        goto out;
     }
 
     if (broker_io && lte_link_is_mqtt_connected(me)) {
-        ret = lwlte_mqtt_subscribe(me->lwlte, topic, (uint8_t)qos);
+        ret = lwlte_mqtt_subscribe(lwlte, topic, (uint8_t)qos);
     }
+
+out:
+    lte_link_end_op(me);
     return ret;
 }
 
@@ -397,6 +458,7 @@ static esp_err_t lte_link_unsubscribe_impl(network_link_t *base,
                                            const char *topic)
 {
     esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
     bool broker_io = false;
 
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
@@ -404,72 +466,91 @@ static esp_err_t lte_link_unsubscribe_impl(network_link_t *base,
                         TAG, "topic is empty");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(me->config.mqtt_enabled, ESP_ERR_NOT_SUPPORTED, TAG,
-                        "mqtt is disabled");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE unsubscribe failed");
+    if (!me->config.mqtt_enabled) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto out;
+    }
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto out;
+    }
     ret = lte_link_internal_remove_subscription(me->sub_table, me->sub_table_size,
                                                 topic);
-    broker_io = (ret == ESP_OK) && !me->destroying;
+    broker_io = (ret == ESP_OK);
     (void)xSemaphoreGive(me->mutex);
     if (ret != ESP_OK) {
-        return ret;
+        goto out;
     }
 
     if (broker_io && lte_link_is_mqtt_connected(me)) {
-        ret = lwlte_mqtt_unsubscribe(me->lwlte, topic);
+        ret = lwlte_mqtt_unsubscribe(lwlte, topic);
     }
+
+out:
+    lte_link_end_op(me);
     return ret;
 }
 
 static esp_err_t lte_link_register_rx_cb_impl(network_link_t *base,
                                               network_rx_cb_t cb, void *ctx)
 {
+    esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
+
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
 
     lte_link_t *me = lte_link_from_base(base);
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE callback registration failed");
+    (void)lwlte;
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        lte_link_end_op(me);
+        return ESP_ERR_TIMEOUT;
+    }
     me->rx_cb = cb;
     me->rx_ctx = cb ? ctx : NULL;
     (void)xSemaphoreGive(me->mutex);
 
     if (cb == NULL) {
-        return lte_link_wait_rx_callbacks_drained(me);
+        ret = lte_link_wait_rx_callbacks_drained(me);
     }
-    return ESP_OK;
+    lte_link_end_op(me);
+    return ret;
 }
 
 static esp_err_t lte_link_set_active_impl(network_link_t *base, bool active)
 {
     esp_err_t ret = ESP_OK;
+    lwlte_handle_t lwlte = NULL;
 
     ESP_RETURN_ON_FALSE(base != NULL, ESP_ERR_INVALID_ARG, TAG, "link is null");
 
     lte_link_t *me = lte_link_from_base(base);
+    ESP_RETURN_ON_ERROR(lte_link_begin_op(me, &lwlte), TAG,
+                        "begin LTE role change failed");
     if (!me->config.mqtt_enabled) {
+        lte_link_end_op(me);
         return ESP_OK;  /* MQTT disabled: role toggle is a no-op */
     }
 
-    /* Call lwlte WITHOUT holding our mutex: lwlte_mqtt_start/stop are async
-     * submits and we must not nest the lte_link mutex here (FSM events dispatch
-     * from the lwlte task and re-enter via the esp_event handlers). */
-    if (me->destroying) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
+    /* Do not hold the link mutex while submitting to esp-lwlte because its
+     * event task can re-enter this object. The operation count keeps lwlte
+     * alive until this call completes. */
     if (active) {
-        ret = lwlte_mqtt_start(me->lwlte);
+        ret = lwlte_mqtt_start(lwlte);
         if (ret == ESP_ERR_INVALID_STATE) {
             ret = ESP_OK;  /* already started/connecting */
         }
     } else {
-        ret = lwlte_mqtt_stop(me->lwlte);
+        ret = lwlte_mqtt_stop(lwlte);
         if (ret == ESP_ERR_INVALID_STATE) {
             ret = ESP_OK;  /* already stopped */
         }
     }
 
+    lte_link_end_op(me);
     return ret;
 }
 
@@ -496,6 +577,76 @@ static esp_err_t lte_link_wait_rx_callbacks_drained(lte_link_t *me)
         vTaskDelay(pdMS_TO_TICKS(LTE_LINK_RX_CB_POLL_MS));
         waited_ms += LTE_LINK_RX_CB_POLL_MS;
     }
+}
+
+static esp_err_t lte_link_wait_destroy_activity_drained(lte_link_t *me)
+{
+    uint32_t waited_ms = 0U;
+
+    ESP_RETURN_ON_FALSE(me != NULL && me->mutex != NULL, ESP_ERR_INVALID_ARG,
+                        TAG, "invalid argument");
+
+    while (true) {
+        ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                            ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+        const int active_rx_callbacks = me->active_rx_callbacks;
+        const int active_ops = me->active_ops;
+        (void)xSemaphoreGive(me->mutex);
+        if (active_rx_callbacks == 0 && active_ops == 0) {
+            return ESP_OK;
+        }
+        if (waited_ms >= LTE_LINK_RX_CB_TIMEOUT_MS) {
+            ESP_LOGE(TAG,
+                     "wait for LTE activity timed out: rx=%d ops=%d",
+                     active_rx_callbacks, active_ops);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(LTE_LINK_RX_CB_POLL_MS));
+        waited_ms += LTE_LINK_RX_CB_POLL_MS;
+    }
+}
+
+static esp_err_t lte_link_begin_op(lte_link_t *me,
+                                   lwlte_handle_t *out_lwlte)
+{
+    ESP_RETURN_ON_FALSE(me != NULL && out_lwlte != NULL, ESP_ERR_INVALID_ARG,
+                        TAG, "invalid argument");
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    if (me->destroying || me->lwlte == NULL) {
+        (void)xSemaphoreGive(me->mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    me->active_ops++;
+    *out_lwlte = me->lwlte;
+    (void)xSemaphoreGive(me->mutex);
+    return ESP_OK;
+}
+
+static void lte_link_end_op(lte_link_t *me)
+{
+    if (me == NULL || me->mutex == NULL ||
+        xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "end LTE operation failed");
+        return;
+    }
+    if (me->active_ops > 0) {
+        me->active_ops--;
+    }
+    (void)xSemaphoreGive(me->mutex);
+}
+
+static void lte_link_mark_destroy_failed(lte_link_t *me)
+{
+    if (me == NULL || me->mutex == NULL ||
+        xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "mark destroy failure failed");
+        return;
+    }
+    me->destroy_in_progress = false;
+    (void)xSemaphoreGive(me->mutex);
 }
 
 static esp_err_t lte_link_validate_config(const lte_link_config_t *config)
@@ -793,11 +944,14 @@ static void lte_link_on_net_event(void *arg, esp_event_base_t base,
                                   int32_t event_id, void *event_data)
 {
     lte_link_t *me = (lte_link_t *)arg;
+    lwlte_handle_t lwlte = NULL;
+
     (void)base;
     (void)event_data;
-    if (me == NULL || me->destroying) {
+    if (me == NULL || lte_link_begin_op(me, &lwlte) != ESP_OK) {
         return;
     }
+    (void)lwlte;
     /* Diagnostic only: status is read live via get_status(). */
     switch ((lwlte_event_id_t)event_id) {
     case LWLTE_EVENT_NET_ONLINE:
@@ -813,20 +967,24 @@ static void lte_link_on_net_event(void *arg, esp_event_base_t base,
     default:
         break;
     }
+    lte_link_end_op(me);
 }
 
 static void lte_link_on_mqtt_event(void *arg, esp_event_base_t base,
                                    int32_t event_id, void *event_data)
 {
     lte_link_t *me = (lte_link_t *)arg;
+    lwlte_handle_t lwlte = NULL;
+
     (void)base;
-    if (me == NULL || me->destroying) {
+    if (me == NULL || lte_link_begin_op(me, &lwlte) != ESP_OK) {
         /* If destroying, still release DATA buffers to avoid leaks. */
         if (event_id == LWLTE_MQTT_EVENT_DATA && event_data != NULL) {
             lwlte_mqtt_event_data_release((lwlte_mqtt_event_data_t *)event_data);
         }
         return;
     }
+    (void)lwlte;
 
     switch ((lwlte_mqtt_event_id_t)event_id) {
     case LWLTE_MQTT_EVENT_CONNECTED:
@@ -845,6 +1003,7 @@ static void lte_link_on_mqtt_event(void *arg, esp_event_base_t base,
     default:
         break;
     }
+    lte_link_end_op(me);
 }
 
 static void lte_link_handle_mqtt_data(lte_link_t *me,

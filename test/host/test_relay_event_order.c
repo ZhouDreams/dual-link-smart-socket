@@ -211,6 +211,63 @@ static void test_relay_toggle_posts_event_before_unlock(void)
     assert(relay_destroy(relay) == ESP_OK);
 }
 
+static void test_relay_set_retries_failed_event_on_same_state(void)
+{
+    const relay_config_t config = {
+        .ctrl_gpio = 6,
+        .active_level = RELAY_ACTIVE_HIGH,
+    };
+    relay_t *relay = relay_create(&config);
+    relay_state_changed_event_t event = {0};
+
+    assert(relay != NULL);
+    reset_spies();
+    s_tracked_relay = relay;
+    s_next_event_post_ret = ESP_ERR_TIMEOUT;
+
+    assert(relay_set(relay, RELAY_SOURCE_SAFETY, true) == ESP_OK);
+    assert(s_event_post_calls == 1);
+    assert(relay->event_pending == true);
+
+    s_next_event_post_ret = ESP_OK;
+    assert(relay_set(relay, RELAY_SOURCE_CLOUD, true) == ESP_OK);
+    assert(s_event_post_calls == 2);
+    assert(relay->event_pending == false);
+    event = read_last_event();
+    assert(event.on == true);
+    assert(event.source == RELAY_SOURCE_SAFETY);
+
+    assert(relay_destroy(relay) == ESP_OK);
+}
+
+static void test_relay_set_replaces_failed_event_with_latest_state(void)
+{
+    const relay_config_t config = {
+        .ctrl_gpio = 7,
+        .active_level = RELAY_ACTIVE_HIGH,
+    };
+    relay_t *relay = relay_create(&config);
+    relay_state_changed_event_t event = {0};
+
+    assert(relay != NULL);
+    reset_spies();
+    s_tracked_relay = relay;
+    s_next_event_post_ret = ESP_ERR_TIMEOUT;
+
+    assert(relay_set(relay, RELAY_SOURCE_SAFETY, true) == ESP_OK);
+    assert(relay->event_pending == true);
+
+    s_next_event_post_ret = ESP_OK;
+    assert(relay_set(relay, RELAY_SOURCE_CLOUD, false) == ESP_OK);
+    assert(s_event_post_calls == 2);
+    assert(relay->event_pending == false);
+    event = read_last_event();
+    assert(event.on == false);
+    assert(event.source == RELAY_SOURCE_CLOUD);
+
+    assert(relay_destroy(relay) == ESP_OK);
+}
+
 static void test_gpio_output_validity_accepts_esp32s3_high_pins(void)
 {
     assert(GPIO_IS_VALID_OUTPUT_GPIO(47));
@@ -222,6 +279,8 @@ int main(void)
 {
     test_relay_set_posts_event_before_unlock();
     test_relay_toggle_posts_event_before_unlock();
+    test_relay_set_retries_failed_event_on_same_state();
+    test_relay_set_replaces_failed_event_with_latest_state();
     test_gpio_output_validity_accepts_esp32s3_high_pins();
 
     printf("relay event order tests passed\n");

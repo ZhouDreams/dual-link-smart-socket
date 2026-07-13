@@ -324,6 +324,8 @@ struct relay {
     relay_active_level_t active_level;
     bool on;
     SemaphoreHandle_t mutex;
+    relay_source_t pending_source;
+    bool event_pending;
     bool initialized;
 };
 ```
@@ -353,7 +355,8 @@ esp_event_handler_register(RELAY_EVENT_BASE, RELAY_EVENT_STATE_CHANGED,
 **关键设计决策**：
 - 配置接受 `gpio_num_t`，不直接依赖 `board_pinmap` — 由 `app_controller` 从 pinmap 读取后填入，保持 relay 的可移植性和可测试性
 - `mutex` 用 `xSemaphoreCreateMutex()` 保护 `on` 字段和 GPIO 操作
-- `relay_set` 仅在状态实际变化时发布 `RELAY_EVENT_STATE_CHANGED`，避免无意义的事件风暴；载荷含新状态和来源，订阅方可按来源过滤（例如云端下发导致的变更不再回传云端）
+- `relay_set` 仅在状态实际变化时生成新的 `RELAY_EVENT_STATE_CHANGED`；若 post 因队列满失败，保留最新 pending 状态，同状态的后续 `set` 会重试，避免 GPIO 状态与订阅方永久漂移
+- pending 只保留最新状态及其来源，载荷来源允许订阅方过滤云端回传；成功 post 后清除 pending
 - `relay_toggle` 原子完成"读-改-写"，不在 get 和 set 之间被其他来源插入
 - 只有 `create` 和 `destroy` 分配/释放资源，`set`/`toggle`/`get` 不涉及堆操作
 
@@ -449,9 +452,11 @@ esp_err_t button_register_cb(button_t *me, button_event_t event,
 struct button {
     gpio_num_t input_gpio;
     button_active_level_t active_level;
-    void *iot_button_handle;
+    button_iot_handle_t iot_button_handle;
     button_event_cb_t callbacks[BUTTON_EVENT_MAX];
     void *user_ctxs[BUTTON_EVENT_MAX];
+    uint32_t active_callbacks[BUTTON_EVENT_MAX];
+    SemaphoreHandle_t mutex;
     bool initialized;
 };
 ```
@@ -476,10 +481,10 @@ button_register_cb(btn, BUTTON_EVENT_SINGLE_CLICK, on_single_click, relay);
 
 /* 注册长按回调 */
 static void on_long_press(button_event_t event, void *user_ctx) {
-    display_service_t *ds = (display_service_t *)user_ctx;
-    display_service_toggle_screen(ds);
+    lvgl_dashboard_t *dashboard = (lvgl_dashboard_t *)user_ctx;
+    lvgl_dashboard_set_screen_enabled(dashboard, true);
 }
-button_register_cb(btn, BUTTON_EVENT_LONG_PRESS_START, on_long_press, display_svc);
+button_register_cb(btn, BUTTON_EVENT_LONG_PRESS_START, on_long_press, dashboard);
 ```
 
 **关键设计决策**：
@@ -676,7 +681,7 @@ esp_event_handler_register(BL0942_EVENT_BASE, BL0942_EVENT_MEASUREMENT,
 │  ┌──────────────────┐                                       │
 │  │ bl0942_read()    │──→ 发送命令 + 阻塞等待响应              │
 │  │                  │    （不与采样任务并发，mutex 串行化）     │
-│  │ bl0942_get_latest│──→ 返回缓存的 latest（不加锁）          │
+│  │ bl0942_get_latest│──→ 加锁后返回缓存的 latest 拷贝          │
 │  └──────────────────┘                                       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -686,7 +691,7 @@ esp_event_handler_register(BL0942_EVENT_BASE, BL0942_EVENT_MEASUREMENT,
 
 - `bl0942_start()` 启动内部采样任务，周期由 `sample_period_ms` 配置（默认 100ms = 10Hz）
 - `bl0942_read()` 是同步阻塞接口，与内部采样任务通过 mutex 串行化，供启动前芯片验证或临时单次读取
-- `bl0942_get_latest()` 返回缓存的最新测量值，无锁读取
+- `bl0942_get_latest()` 在 mutex 保护下返回缓存的最新测量值拷贝
 - 内部故障检测：连续失败达 `fault_threshold` → 发布 `BL0942_EVENT_FAULT` → 自动 EN-pin 硬复位 → 硬复位超 `hard_reset_max_attempts` 则停止采样任务
 - UART 配置只用单一波特率（`baud_rate`），不做启动波特率→运行波特率切换
 - 原始寄存器值不在此层转换工程量，换算逻辑属于 `metering_service`
@@ -725,6 +730,7 @@ typedef struct {
     esp_err_t (*unsubscribe)(network_link_t *me, const char *topic);
     esp_err_t (*register_rx_cb)(network_link_t *me, network_rx_cb_t cb,
                                  void *ctx);
+    esp_err_t (*set_active)(network_link_t *me, bool active);
 } network_link_ops_t;
 ```
 
@@ -740,6 +746,7 @@ typedef struct {
 | `subscribe` | 在当前链路上注册主题订阅，支持重连后重放 |
 | `unsubscribe` | 撤销订阅 |
 | `register_rx_cb` | 注册下行消息回调，同一时刻只保留一个回调 |
+| `set_active` | 选填的上岗/卸岗操作；未实现时包装函数按成功 no-op 处理 |
 
 ### 6.3 `network_link_t` — 基类句柄
 
@@ -768,6 +775,7 @@ esp_err_t network_link_subscribe(network_link_t *me, const char *topic,
 esp_err_t network_link_unsubscribe(network_link_t *me, const char *topic);
 esp_err_t network_link_register_rx_cb(network_link_t *me,
                                        network_rx_cb_t cb, void *ctx);
+esp_err_t network_link_set_active(network_link_t *me, bool active);
 network_link_type_t network_link_get_type(const network_link_t *me);
 ```
 
@@ -816,6 +824,7 @@ static const network_link_ops_t wifi_link_ops = {
     .subscribe      = wifi_link_subscribe_impl,
     .unsubscribe    = wifi_link_unsubscribe_impl,
     .register_rx_cb = wifi_link_register_rx_cb_impl,
+    .set_active     = NULL,
 };
 
 network_link_t *wifi_link_create(const wifi_link_config_t *config)
@@ -890,7 +899,7 @@ Metering Service 是业务服务层的电参量快照模块，消费 1 Hz `BL094
 |----|--------|---------|---------|------|
 | `metering_service_t` | 用户 API (opaque) | app_controller | 句柄 | struct 定义在 .c |
 | `metering_config_t` | 用户 API | app_controller | 配置结构体 | 工程量转换系数 |
-| `metering_snapshot_t` | 用户 API | safety_guard + thingsboard_client + display_service | 值对象 | 单次采样工程量快照 |
+| `metering_snapshot_t` | 用户 API | safety_guard + thingsboard_client + lvgl_dashboard | 值对象 | 单次采样工程量快照 |
 
 ### 7.2 `metering_config_t` — 初始化配置
 
@@ -1016,7 +1025,7 @@ metering_service（在 esp_event handler 上下文）
     │  CF 计数 → 区间电能增量 mWh + 确认令牌
     │  发布 METERING_EVENT_SNAPSHOT
     ▼
-safety_guard / thingsboard_client / display_service
+safety_guard / thingsboard_client / lvgl_dashboard
 ```
 
 ### 7.6 关键设计决策
@@ -1077,7 +1086,7 @@ typedef struct {
 
 ```c
 typedef struct {
-    char topic[WIFI_LINK_MAX_TOPIC_LEN];
+    char *topic;
     network_mqtt_qos_t qos;
     bool in_use;
 } wifi_link_sub_entry_t;
@@ -1085,8 +1094,17 @@ typedef struct {
 struct wifi_link {
     network_link_t base;                       // 必须是第一个字段
     wifi_link_config_t config;
+    char *ssid;
+    char *password;
+    char *mqtt_broker_host;
+    char *mqtt_client_id;
+    char *mqtt_username;
+    char *mqtt_password;
+    char *mqtt_uri;
     // Wi-Fi
     esp_netif_t *netif;
+    esp_event_handler_instance_t wifi_event_instance;
+    esp_event_handler_instance_t ip_event_instance;
     bool wifi_connected;
     // MQTT
     esp_mqtt_client_handle_t mqtt_client;
@@ -1094,6 +1112,7 @@ struct wifi_link {
     // 订阅表
     wifi_link_sub_entry_t *sub_table;
     int sub_table_size;
+    int max_topic_len;
     // 线程安全
     SemaphoreHandle_t mutex;
     // 下行回调
@@ -1101,7 +1120,12 @@ struct wifi_link {
     void *rx_ctx;
     // 状态
     bool started;
+    bool starting;
+    bool stopping;
+    bool start_failed;
     bool destroying;
+    int runtime_action_count;
+    bool mqtt_op_active;
 };
 ```
 
@@ -1119,9 +1143,9 @@ network_link_t *wifi_link_create(const wifi_link_config_t *config);
 |----------|----------|------|
 | `destroy` | `wifi_link_destroy_impl` | 停止链路 + 释放 netif / mqtt_client / sub_table / 自身 |
 | `start` | `wifi_link_start_impl` | 初始化 TCP/IP + netif → 注册 Wi-Fi 事件 → 启动 STA |
-| `stop` | `wifi_link_stop_impl` | 断开 MQTT → 断开 Wi-Fi → 保留资源可重 start |
+| `stop` | `wifi_link_stop_impl` | 断开 MQTT/Wi-Fi 并释放运行资源；配置和订阅意图保留，可重新 start |
 | `get_status` | `wifi_link_get_status_impl` | 返回 `{WIFI, state, link_up, mqtt_ready}` |
-| `publish` | `wifi_link_publish_impl` | `esp_mqtt_client_enqueue()` |
+| `publish` | `wifi_link_publish_impl` | `esp_mqtt_client_publish()` 同步提交，可能短时阻塞调用方 |
 | `subscribe` | `wifi_link_subscribe_impl` | 写入订阅表 + `esp_mqtt_client_subscribe()` |
 | `unsubscribe` | `wifi_link_unsubscribe_impl` | 移除订阅表 + `esp_mqtt_client_unsubscribe()` |
 | `register_rx_cb` | `wifi_link_register_rx_cb_impl` | 保存回调 + 上下文，同一时刻只保留一个 |
@@ -1149,7 +1173,7 @@ esp_mqtt MQTT_EVENT_DATA
     ▼
 wifi_link mqtt event handler（在 esp_mqtt 内部任务上下文）
     │  构造 network_rx_data_t
-    │  调用 rx_cb(rx_data, rx_ctx)（持有 mutex 读取）
+    │  锁内快照回调并登记在途操作，释放 mutex 后调用 rx_cb
     ▼
 network_manager（或直接 thingsboard_client）
 ```
@@ -1283,16 +1307,21 @@ esp_err_t network_manager_register_rx_cb(network_manager_t *me,
 
 ```c
 typedef struct {
-    char topic[NETWORK_MANAGER_MAX_TOPIC_LEN];
+    char *topic;
     network_mqtt_qos_t qos;
     bool in_use;
 } network_manager_sub_entry_t;
 
+typedef struct {
+    network_manager_t *manager;
+    network_link_t *link;
+} network_manager_rx_bridge_ctx_t;
+
 struct network_manager {
+    // create 时根据 preferred_primary 规范化：primary 始终是首选链路
     network_link_t *primary;
     network_link_t *backup;
     network_link_t *active;
-    network_link_type_t preferred_primary;
     uint32_t failover_recheck_ms;
     uint32_t failback_delay_ms;
     // 订阅意图表
@@ -1303,9 +1332,16 @@ struct network_manager {
     // 下行回调
     network_rx_cb_t rx_cb;
     void *rx_ctx;
+    int active_rx_callbacks;
     // 内部状态
     uint64_t failback_since_us;
+    TaskHandle_t monitor_task;
+    SemaphoreHandle_t monitor_task_done_sema;
+    network_manager_rx_bridge_ctx_t primary_rx_ctx;
+    network_manager_rx_bridge_ctx_t backup_rx_ctx;
+    bool monitor_task_running;
     bool started;
+    bool stop_pending;
     bool destroying;
 };
 ```
@@ -1331,7 +1367,8 @@ struct network_manager {
 ### 9.6 关键设计决策
 
 - 持有 `primary` 和 `backup` 两个 `network_link_t *`，通过包装函数操作，不感知子类类型
-- `start()` 启动首选主链路，`active` 指向它；若 primary 无法启动则尝试 backup
+- `create()` 根据 `preferred_primary` 规范化注入链路：匹配该类型的链路成为内部 `primary`；传 `NONE` 时保持调用方的 `primary`
+- `start()` 启动规范化后的首选主链路，`active` 指向它；若启动失败则尝试 backup
 - 订阅意图表：`subscribe`/`unsubscribe` 写入表 → 立即委托给当前 `active` 链路；活动链路切换后遍历表在新链路上全部重放
 - `rx_cb` 统一接收当前活动链路的下行消息，透传给 `thingsboard_client`
 - 回切延迟防止 Wi-Fi 抖动导致频繁来回切换
@@ -1420,6 +1457,9 @@ esp_err_t safety_guard_get_latest(safety_guard_t *me,
                                    safety_guard_snapshot_t *out);
 esp_err_t safety_guard_set_thresholds(safety_guard_t *me,
                                        float overcurrent_a, float overpower_w);
+esp_err_t safety_guard_get_thresholds(safety_guard_t *me,
+                                       float *out_overcurrent_a,
+                                       float *out_overpower_w);
 ```
 
 **事件声明**：
@@ -1442,6 +1482,9 @@ struct safety_guard {
     bool has_latest;
     int overcurrent_persistence;
     int overpower_persistence;
+    esp_event_handler_instance_t metering_handler;
+    bool started;
+    bool stopping;
     bool initialized;
 };
 ```
@@ -1531,17 +1574,23 @@ int tft_panel_get_height(const tft_panel_t *me);
 ```c
 struct tft_panel {
     tft_panel_config_t config;
-    spi_device_handle_t spi;
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_handle_t panel;
+    SemaphoreHandle_t mutex;
+    portMUX_TYPE callback_lock;
     tft_panel_flush_done_cb_t flush_done_cb;
     void *flush_done_ctx;
     bool backlight_on;
     bool initialized;
+    bool spi_bus_initialized;
+    bool destroying;
 };
 ```
 
 ### 11.4 关键设计决策
 
 - 封装 SPI host 初始化和 LCD 初始化序列（ST7789 等），对上层只暴露 `draw_bitmap` 和背光控制
+- ST7789T 构造时根据 RGB/BGR 配置保存 `madctl_val`，init 必须发送该值，后续 mirror/swap 只在其上增减方向位
 - LVGL 的 `flush_cb` 由 `lvgl_dashboard` 注册，内部调用 `tft_panel_draw_bitmap`
 - `tft_panel_config_t` 从 `board_pinmap` 读取 SPI 引脚后注入，不内部依赖 pinmap
 - `panel_width`/`panel_height` 由调用方配置（ESP32-S3-LCD-1.47B 为 172×320）
@@ -1639,11 +1688,20 @@ struct lvgl_dashboard {
     lvgl_dashboard_config_t config;
     SemaphoreHandle_t mutex;
     dashboard_state_t state_cache;
-    // LVGL
-    lv_disp_t *display;
+    lv_display_t *display;
     TaskHandle_t lvgl_task;
     SemaphoreHandle_t lvgl_task_done_sema;
-    // 控件引用
+    portMUX_TYPE flush_lock;
+    esp_timer_handle_t tick_timer;
+    lvgl_dashboard_tick_ctx_t *tick_ctx;
+    void *draw_buf_1;
+    void *draw_buf_2;
+    lv_obj_t *screen;
+    lv_obj_t *network_pill;
+    lv_obj_t *relay_pill;
+    lv_obj_t *power_card;
+    lv_obj_t *voltage_card;
+    lv_obj_t *current_card;
     lv_obj_t *label_voltage;
     lv_obj_t *label_current;
     lv_obj_t *label_power;
@@ -1651,10 +1709,20 @@ struct lvgl_dashboard {
     lv_obj_t *label_relay;
     lv_obj_t *label_network;
     lv_obj_t *label_safety;
-    // 状态
-    bool screen_enabled;
+    esp_event_handler_instance_t metering_handler;
+    esp_event_handler_instance_t relay_handler;
+    esp_event_handler_instance_t safety_handler;
+    dashboard_state_t rendered_state;
+    uint32_t pending_flushes;
+    bool rendered_stale;
+    bool has_rendered_state;
+    bool lvgl_task_running;
     bool started;
     bool initialized;
+    bool destroying;
+    bool lvgl_initialized_by_me;
+    bool flush_cb_registered;
+    bool tick_timer_started;
 };
 ```
 
@@ -1952,11 +2020,13 @@ struct lte_link {
     network_rx_cb_t rx_cb;
     void *rx_ctx;
     int active_rx_callbacks;
+    int active_ops;
     esp_event_handler_instance_t net_handler;
     esp_event_handler_instance_t mqtt_handler;
     // 状态
     bool started;
     bool destroying;
+    bool destroy_in_progress;
 };
 ```
 
@@ -2011,6 +2081,9 @@ ERROR / DESTROYING         → ERROR
 ### 14.7 关键设计决策
 
 - `lte_link_create()` 只创建 esp-lwlte 门面对象；`start()` 异步启动网络，`set_active(true)` 单独启动 MQTT
+- 所有 public ops 和已进入的 esp-lwlte event handler 都在锁内登记 `active_ops`；调用 esp-lwlte 或外部回调时可释放 link mutex，但对象和 lwlte 句柄保持有效
+- destroy 先设置 `destroying` 禁止新操作，再等待 `active_ops` 和 RX 回调归零；`destroy_in_progress` 拒绝重入销毁
+- `lwlte_destroy()` 失败时保留 LTE link 及其 lwlte 句柄并原样返回错误；仅 ESP_OK 消费句柄
 - `lte_link` 维护自己的订阅表，因为 esp-lwlte 的 MQTT subscribe 不记住订阅意图，重连后需 lte_link 重放
 - 配置中大量 esp-lwlte 调优参数（`at_rx_buf_size`、`modem_event_queue_size` 等）不暴露，内部填 0 使用 esp-lwlte 默认值
 - esp-lwlte 通过 `EXTRA_COMPONENT_DIRS` 指向 `/Users/jovisdreams/Projects/esp-lwlte`
@@ -2076,7 +2149,27 @@ esp_err_t app_controller_stop(app_controller_t *me);
 ```c
 struct app_controller {
     app_controller_config_t cfg;
+    SemaphoreHandle_t mutex;
+    esp_event_handler_instance_t safety_handler;
+    esp_event_handler_instance_t startup_metering_handler;
+    esp_event_handler_instance_t metering_handler;
+    esp_event_handler_instance_t relay_handler;
+    bool startup_metering_discard_by_app;
+    bool relay_on;
+    bool relay_known;
+    bool screen_enabled;
     bool started;
+    bool starting;
+    bool stopping;
+    bool button_single_registered;
+    bool button_long_registered;
+    bool tb_command_registered;
+    bool bl0942_started;
+    bool metering_started;
+    bool safety_started;
+    bool net_mgr_started;
+    bool tb_started;
+    bool dashboard_started;
 };
 ```
 
@@ -2138,6 +2231,8 @@ static void on_safety_snapshot(void *arg, esp_event_base_t base,
 }
 ```
 
+`safety_guard` 的计量 handler 必须先于 app_controller 的常规计量 handler 注册。后者在发布遥测前调用 `safety_guard_get_latest()` 并执行 `RELAY_OFF`，作为安全事件队列满时的本地兜底；`SAFETY_GUARD_EVENT_SNAPSHOT` handler 保留为独立广播路径。两条路径都通过同一幂等动作函数进入 `relay_set(RELAY_SOURCE_SAFETY, false)`。
+
 **TB 命令 → 继电器/安全阈值**：
 ```c
 static void on_tb_command(const tb_command_t *cmd, void *ctx) {
@@ -2154,7 +2249,10 @@ static void on_tb_command(const tb_command_t *cmd, void *ctx) {
         break;
     }
     case TB_COMMAND_SET_POWER_LIMIT:
-        safety_guard_set_thresholds(app->cfg.safety, 0, cmd->power_limit_w);
+        float current_a = 0.0f;
+        safety_guard_get_thresholds(app->cfg.safety, &current_a, NULL);
+        safety_guard_set_thresholds(app->cfg.safety, current_a,
+                                    cmd->power_limit_w);
         break;
     }
 }

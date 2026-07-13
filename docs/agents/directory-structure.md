@@ -266,21 +266,22 @@ thingsboard/
 
 ```text
 display/
-├── display_service.c
-├── display_service.h
 ├── lvgl/
 │   ├── lvgl_dashboard.c
-│   └── lvgl_dashboard.h
+│   ├── lvgl_dashboard.h
+│   ├── lvgl_dashboard_internal.c
+│   └── lvgl_dashboard_internal.h
 └── tft/
     ├── tft_panel.c
-    └── tft_panel.h
+    ├── tft_panel.h
+    ├── tft_panel_st7789t.c
+    └── tft_panel_st7789t.h
 ```
 
 职责：
 
-1. `display_service` 汇总系统状态并生成显示快照。
-2. `lvgl_dashboard` 负责 LVGL 控件树和 UI 状态更新。
-3. `tft_panel` 负责 LCD 面板初始化、flush 和背光控制。
+1. `lvgl_dashboard` 直接订阅业务事件，维护显示状态缓存并负责 LVGL 控件树更新。
+2. `tft_panel` 负责 LCD 面板初始化、flush 和背光控制。
 
 ### `safety/`
 

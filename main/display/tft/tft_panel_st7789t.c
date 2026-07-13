@@ -321,12 +321,13 @@ static esp_err_t tft_panel_st7789t_init(esp_lcd_panel_t *panel)
                         TAG, "sleep out failed");
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(st7789t->io, 0x36,
-                                                  (uint8_t[]){0x00}, 1),
-                        TAG, "madctl init failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(st7789t->io, 0x3A,
-                                                  (uint8_t[]){st7789t->colmod_val}, 1),
-                        TAG, "colmod init failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(
+                            st7789t->io, LCD_CMD_MADCTL,
+                            (uint8_t[]){st7789t->madctl_val}, 1),
+                         TAG, "madctl init failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(st7789t->io, LCD_CMD_COLMOD,
+                                                   (uint8_t[]){st7789t->colmod_val}, 1),
+                         TAG, "colmod init failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(st7789t->io, 0xB0,
                                                   (uint8_t[]){0x00, 0xE8}, 2),
                         TAG, "ramctrl init failed");

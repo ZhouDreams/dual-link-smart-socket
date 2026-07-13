@@ -35,6 +35,18 @@ mkdir -p "${BUILD_DIR}"
 "${BUILD_DIR}/test_lte_link_internal"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/main/network" \
+    -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/network/lte" \
+    "${ROOT_DIR}/main/network/network_link.c" \
+    "${ROOT_DIR}/main/network/lte/lte_link_internal.c" \
+    "${ROOT_DIR}/main/network/lte/lte_link.c" \
+    "${ROOT_DIR}/test/host/test_lte_link_lifecycle.c" \
+    -o "${BUILD_DIR}/test_lte_link_lifecycle"
+
+"${BUILD_DIR}/test_lte_link_lifecycle"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/network" \
     -I"${ROOT_DIR}/main/network/wifi" \
@@ -43,6 +55,24 @@ mkdir -p "${BUILD_DIR}"
     -o "${BUILD_DIR}/test_wifi_link_internal"
 
 "${BUILD_DIR}/test_wifi_link_internal"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/main/network" \
+    -I"${ROOT_DIR}/test/support" \
+    "${ROOT_DIR}/main/network/network_link.c" \
+    "${ROOT_DIR}/test/host/test_network_manager_preference.c" \
+    -o "${BUILD_DIR}/test_network_manager_preference"
+
+"${BUILD_DIR}/test_network_manager_preference"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/display/tft" \
+    "${ROOT_DIR}/main/display/tft/tft_panel_st7789t.c" \
+    "${ROOT_DIR}/test/host/test_tft_panel_st7789t_init.c" \
+    -o "${BUILD_DIR}/test_tft_panel_st7789t_init"
+
+"${BUILD_DIR}/test_tft_panel_st7789t_init"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
