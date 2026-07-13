@@ -38,8 +38,10 @@ struct app_controller {
     app_controller_config_t cfg;
     SemaphoreHandle_t mutex;
     esp_event_handler_instance_t safety_handler;
+    esp_event_handler_instance_t startup_metering_handler;
     esp_event_handler_instance_t metering_handler;
     esp_event_handler_instance_t relay_handler;
+    bool startup_metering_discard_by_app;
     bool relay_on;
     bool relay_known;
     bool screen_enabled;
@@ -94,6 +96,15 @@ static void app_controller_on_metering_snapshot(void *handler_args,
                                                 void *event_data);
 
 /**
+ * @brief 处理启动阶段电参量快照事件
+ * @details Handle startup-phase metering snapshot event
+ */
+static void app_controller_on_startup_metering_snapshot(void *handler_args,
+                                                        esp_event_base_t event_base,
+                                                        int32_t event_id,
+                                                        void *event_data);
+
+/**
  * @brief 处理继电器状态事件
  * @details Handle relay state event
  */
@@ -126,6 +137,18 @@ static esp_err_t app_controller_clear_button_callbacks(app_controller_t *me);
  * @details Register event handlers
  */
 static esp_err_t app_controller_register_event_handlers(app_controller_t *me);
+
+/**
+ * @brief 注册启动阶段电参量事件处理器
+ * @details Register startup metering event handler
+ */
+static esp_err_t app_controller_register_startup_metering_handler(app_controller_t *me);
+
+/**
+ * @brief 注册电参量事件处理器
+ * @details Register metering event handler
+ */
+static esp_err_t app_controller_register_metering_handler(app_controller_t *me);
 
 /**
  * @brief 注销事件处理器
@@ -293,6 +316,7 @@ esp_err_t app_controller_start(app_controller_t *me)
         return ESP_OK;
     }
     me->starting = true;
+    me->startup_metering_discard_by_app = false;
     (void)xSemaphoreGive(me->mutex);
 
     ret = app_controller_register_button_callbacks(me);
@@ -322,10 +346,47 @@ esp_err_t app_controller_start(app_controller_t *me)
         goto err;
     }
 
+    ret = app_controller_register_startup_metering_handler(me);
+    if (ret != ESP_OK) {
+        original_error = ret;
+        goto err;
+    }
+
     ret = app_controller_start_modules(me);
     if (ret != ESP_OK) {
         original_error = ret;
         goto err;
+    }
+
+    ret = app_controller_register_metering_handler(me);
+    if (ret != ESP_OK) {
+        original_error = ret;
+        goto err;
+    }
+    ret = app_controller_set_flag(me, &me->startup_metering_discard_by_app,
+                                  true);
+    if (ret != ESP_OK) {
+        original_error = ret;
+        goto err;
+    }
+
+    if (me->startup_metering_handler != NULL) {
+        if (me->cfg.event_loop != NULL) {
+            ret = esp_event_handler_instance_unregister_with(
+                me->cfg.event_loop, METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+                me->startup_metering_handler);
+        } else {
+            ret = esp_event_handler_instance_unregister(METERING_EVENT_BASE,
+                                                        METERING_EVENT_SNAPSHOT,
+                                                        me->startup_metering_handler);
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "unregister startup metering handler failed: %s",
+                     esp_err_to_name(ret));
+            original_error = ret;
+            goto err;
+        }
+        me->startup_metering_handler = NULL;
     }
 
     ESP_GOTO_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
@@ -492,12 +553,20 @@ static void app_controller_on_metering_snapshot(void *handler_args,
 {
     app_controller_t *me = (app_controller_t *)handler_args;
     metering_snapshot_t *snapshot = (metering_snapshot_t *)event_data;
+    bool app_owns_startup_discard = true;
 
     if (event_base != METERING_EVENT_BASE || event_id != METERING_EVENT_SNAPSHOT ||
         snapshot == NULL || me == NULL) {
         return;
     }
     if (!app_controller_is_running(me)) {
+        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+            app_owns_startup_discard = me->startup_metering_discard_by_app;
+            (void)xSemaphoreGive(me->mutex);
+        }
+        if (!app_owns_startup_discard) {
+            return;
+        }
         app_controller_discard_energy_delta(me, snapshot, "controller not running");
         return;
     }
@@ -506,6 +575,31 @@ static void app_controller_on_metering_snapshot(void *handler_args,
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "publish telemetry failed: %s", esp_err_to_name(ret));
     }
+}
+
+static void app_controller_on_startup_metering_snapshot(void *handler_args,
+                                                        esp_event_base_t event_base,
+                                                        int32_t event_id,
+                                                        void *event_data)
+{
+    app_controller_t *me = (app_controller_t *)handler_args;
+    metering_snapshot_t *snapshot = (metering_snapshot_t *)event_data;
+    bool app_owns_startup_discard = false;
+
+    if (event_base != METERING_EVENT_BASE || event_id != METERING_EVENT_SNAPSHOT ||
+        snapshot == NULL || me == NULL || app_controller_is_running(me)) {
+        return;
+    }
+
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
+        app_owns_startup_discard = me->startup_metering_discard_by_app;
+        (void)xSemaphoreGive(me->mutex);
+    }
+    if (app_owns_startup_discard) {
+        return;
+    }
+
+    app_controller_discard_energy_delta(me, snapshot, "controller not running");
 }
 
 static void app_controller_on_relay_state_changed(void *handler_args,
@@ -716,21 +810,6 @@ static esp_err_t app_controller_register_event_handlers(app_controller_t *me)
 
     if (me->cfg.event_loop != NULL) {
         ret = esp_event_handler_instance_register_with(
-            me->cfg.event_loop, METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
-            app_controller_on_metering_snapshot, me, &me->metering_handler);
-    } else {
-        ret = esp_event_handler_instance_register(
-            METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
-            app_controller_on_metering_snapshot, me, &me->metering_handler);
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "register metering handler failed: %s",
-                 esp_err_to_name(ret));
-        return ret;
-    }
-
-    if (me->cfg.event_loop != NULL) {
-        ret = esp_event_handler_instance_register_with(
             me->cfg.event_loop, RELAY_EVENT_BASE, RELAY_EVENT_STATE_CHANGED,
             app_controller_on_relay_state_changed, me, &me->relay_handler);
     } else {
@@ -740,6 +819,50 @@ static esp_err_t app_controller_register_event_handlers(app_controller_t *me)
     }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "register relay handler failed: %s",
+                 esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+static esp_err_t app_controller_register_startup_metering_handler(app_controller_t *me)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (me->cfg.event_loop != NULL) {
+        ret = esp_event_handler_instance_register_with(
+            me->cfg.event_loop, METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+            app_controller_on_startup_metering_snapshot, me,
+            &me->startup_metering_handler);
+    } else {
+        ret = esp_event_handler_instance_register(
+            METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+            app_controller_on_startup_metering_snapshot, me,
+            &me->startup_metering_handler);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register startup metering handler failed: %s",
+                 esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+static esp_err_t app_controller_register_metering_handler(app_controller_t *me)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (me->cfg.event_loop != NULL) {
+        ret = esp_event_handler_instance_register_with(
+            me->cfg.event_loop, METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+            app_controller_on_metering_snapshot, me, &me->metering_handler);
+    } else {
+        ret = esp_event_handler_instance_register(
+            METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+            app_controller_on_metering_snapshot, me, &me->metering_handler);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register metering handler failed: %s",
                  esp_err_to_name(ret));
     }
 
@@ -771,6 +894,17 @@ static esp_err_t app_controller_unregister_event_handlers(app_controller_t *me)
         app_controller_capture_first_error(ret, &first_error);
     }
 
+    if (me->startup_metering_handler != NULL) {
+        ret = app_controller_set_flag(me, &me->startup_metering_discard_by_app,
+                                      false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "restore startup metering discard ownership failed: %s",
+                     esp_err_to_name(ret));
+        }
+        app_controller_capture_first_error(ret, &first_error);
+    }
+
     if (me->metering_handler != NULL) {
         if (me->cfg.event_loop != NULL) {
             ret = esp_event_handler_instance_unregister_with(
@@ -786,6 +920,26 @@ static esp_err_t app_controller_unregister_event_handlers(app_controller_t *me)
             me->metering_handler = NULL;
         } else {
             ESP_LOGW(TAG, "unregister metering handler failed: %s",
+                     esp_err_to_name(ret));
+        }
+        app_controller_capture_first_error(ret, &first_error);
+    }
+
+    if (me->startup_metering_handler != NULL) {
+        if (me->cfg.event_loop != NULL) {
+            ret = esp_event_handler_instance_unregister_with(
+                me->cfg.event_loop, METERING_EVENT_BASE, METERING_EVENT_SNAPSHOT,
+                me->startup_metering_handler);
+        } else {
+            ret = esp_event_handler_instance_unregister(METERING_EVENT_BASE,
+                                                        METERING_EVENT_SNAPSHOT,
+                                                        me->startup_metering_handler);
+        }
+        ret = app_controller_filter_stop_error(ret);
+        if (ret == ESP_OK) {
+            me->startup_metering_handler = NULL;
+        } else {
+            ESP_LOGW(TAG, "unregister startup metering handler failed: %s",
                      esp_err_to_name(ret));
         }
         app_controller_capture_first_error(ret, &first_error);
@@ -942,6 +1096,7 @@ static bool app_controller_is_fully_stopped_locked(const app_controller_t *me)
            !me->bl0942_started && !me->metering_started &&
            !me->safety_started && !me->net_mgr_started && !me->tb_started &&
            !me->dashboard_started && me->safety_handler == NULL &&
+           me->startup_metering_handler == NULL &&
            me->metering_handler == NULL && me->relay_handler == NULL;
 }
 

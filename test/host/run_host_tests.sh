@@ -72,4 +72,22 @@ mkdir -p "${BUILD_DIR}"
 
 "${BUILD_DIR}/test_app_controller_internal"
 
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/main/safety" \
+    -I"${ROOT_DIR}/main/metering" \
+    -I"${ROOT_DIR}/main/relay" \
+    -I"${ROOT_DIR}/main/button" \
+    -I"${ROOT_DIR}/main/bl0942" \
+    -I"${ROOT_DIR}/main/platform" \
+    -I"${ROOT_DIR}/main/network" \
+    -I"${ROOT_DIR}/main/thingsboard" \
+    -I"${ROOT_DIR}/main/display/lvgl" \
+    -I"${ROOT_DIR}/main/display/tft" \
+    -I"${ROOT_DIR}/main/app" \
+    -I"${ROOT_DIR}/test/support" \
+    "${ROOT_DIR}/test/host/test_app_controller_event_order.c" \
+    -o "${BUILD_DIR}/test_app_controller_event_order"
+
+"${BUILD_DIR}/test_app_controller_event_order"
+
 echo "host tests passed"
