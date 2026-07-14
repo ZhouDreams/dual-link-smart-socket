@@ -310,6 +310,7 @@ safety/
 docs/
 └── agents/
     ├── architecture.md
+    ├── hardware_design.md
     ├── directory-structure.md
     ├── classes.md
     ├── coding-style.md
@@ -329,6 +330,7 @@ AI 编码助手和开发会话的长期上下文目录。
 | 文档 | 职责 |
 |------|------|
 | `architecture.md` | 总体架构、分层、模块边界、数据流 |
+| `hardware_design.md` | 硬件方案、模块接口、PCB 打样约束和验证记录 |
 | `directory-structure.md` | 目录组织和文件归属 |
 | `classes.md` | 主要类、句柄、结构体、API 形态 |
 | `coding-style.md` | 代码格式、注释模板、Doxygen 规范 |

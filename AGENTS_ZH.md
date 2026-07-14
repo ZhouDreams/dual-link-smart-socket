@@ -12,6 +12,7 @@ Smart_Socket 是一个基于 ESP32-S3 的双模联网智能插座系统，集成
 |------|------|
 | 目录说明 | [docs/agents/directory-structure.md](docs/agents/directory-structure.md) |
 | 架构概览 | [docs/agents/architecture.md](docs/agents/architecture.md) |
+| 硬件设计 | [docs/agents/hardware_design.md](docs/agents/hardware_design.md) |
 | 构建与调试 | [docs/agents/build-and-debug.md](docs/agents/build-and-debug.md) |
 | 代码规范与模板 | [docs/agents/coding-style.md](docs/agents/coding-style.md) |
 | C 语言 OOP 设计规范 | [docs/agents/oop-design.md](docs/agents/oop-design.md) |

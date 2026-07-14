@@ -12,6 +12,7 @@ Smart_Socket is a dual-mode networked smart socket system based on ESP32-S3, fea
 |-------|----------|
 | Directory Structure | [docs/agents/directory-structure.md](docs/agents/directory-structure.md) |
 | Architecture | [docs/agents/architecture.md](docs/agents/architecture.md) |
+| Hardware Design | [docs/agents/hardware_design.md](docs/agents/hardware_design.md) |
 | Class Design | [docs/agents/classes.md](docs/agents/classes.md) |
 | Build & Debug | [docs/agents/build-and-debug.md](docs/agents/build-and-debug.md) |
 | Coding Style & Templates | [docs/agents/coding-style.md](docs/agents/coding-style.md) |
