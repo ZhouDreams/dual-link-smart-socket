@@ -1,6 +1,6 @@
 # Code Review 修复状态
 
-**状态日期**：2026-07-13
+**状态日期**：2026-07-14
 
 本文只跟踪 `summary-2026-07-07.md` 中需要实际修复的高价值问题。原始 report/verify 保留为审查证据，其中的 `N/A` 和“未修复”描述代表 2026-07-07 当时状态。
 
@@ -20,12 +20,21 @@
 | network_manager F-1：preferred_primary 不生效 | 已修复 | create 时规范化主备 + `test_network_manager_preference` |
 | TFT #1：MADCTL 初始化丢失 BGR 位 | 已修复 | 使用 `madctl_val` + `test_tft_panel_st7789t_init` |
 | architecture 中不存在的 display_service | 已修复 | 显示流改为 lvgl_dashboard 直接订阅业务事件 |
+| MS-02 / app M2：stop 收尾 mutex 中断后遗留 `stopping` | 已修复 | 重试取得收尾锁、恢复一致状态后返回超时 + app/metering lifecycle tests |
+
+## 生命周期台账核对
+
+| 原问题 | 当前结论 | 依据 |
+|--------|----------|------|
+| app M1：destroy 在 stop 失败后不释放对象 | 关闭，非消费式失败语义 | 未完成清理仍可能引用 controller；失败保留句柄、重试只处理 pending 项，测试覆盖首次失败后成功 destroy |
+| MS-03：destroy 在 stop 失败后不释放对象 | 关闭，非消费式失败语义 | handler 注销失败时不能释放其 `arg=me`；测试覆盖部分注销失败后保留句柄并重试 |
+| network_manager D-1：destroy 失败后不释放 manager | 关闭，非消费式失败语义 | monitor/link RX bridge 仍可能引用 manager；保持 `destroying`，链路 stop 失败时另保留 `stop_pending`，测试覆盖 link stop 失败 |
+| button M1：底层 delete 失败后不释放 button | 接受当前约束，保留升级复核项 | 当前仅 GPIO backend 且 GPIO 创建前已校验，ESP-IDF 6.0 `gpio_reset_pin(valid_gpio)` 只返回 `ESP_OK`；`espressif/button` 4.1.6 对未来可失败 backend 存在部分销毁风险 |
 
 ## 仍需处理
 
 | 优先级 | 问题 | 当前判断 |
 |--------|------|----------|
-| P1 防御性 | MS-02 / app M2：stop 尾部 mutex take 失败会遗留 `stopping` | `portMAX_DELAY` 下触发概率极低，但状态恢复路径仍不完整 |
 | P2 | network_manager C-1：持锁调用链路 set_active / subscribe | 当前链路 API 为快速异步提交；扩展同步链路前应解耦 |
 | P2 | network_manager C-2：链路事件任务无限等待 manager mutex | 当前临界区短，但会放大未来阻塞 |
 | P2 | BL0942-MUTEX-DELAY：hard reset 持锁约 2 秒 | 当前无外部并发读取调用方，公共 API 风险仍存在 |

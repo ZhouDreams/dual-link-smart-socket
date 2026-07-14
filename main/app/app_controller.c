@@ -172,6 +172,16 @@ static esp_err_t app_controller_stop_impl(app_controller_t *me,
                                           bool from_start_rollback);
 
 /**
+ * @brief 获取不可跳过状态更新所需的互斥量
+ * @details Take the mutex required for a non-skippable state update
+ * @param[in] me 应用控制器句柄； App controller handle
+ * @param[in] operation 日志中的操作名称； Operation name for logging
+ * @return true 等待曾被中断，false 首次即成功； true if the wait was interrupted, false if acquired immediately
+ */
+static bool app_controller_take_state_mutex(app_controller_t *me,
+                                            const char *operation);
+
+/**
  * @brief 设置生命周期标志
  * @details Set lifecycle flag
  */
@@ -427,6 +437,7 @@ static esp_err_t app_controller_stop_impl(app_controller_t *me,
     esp_err_t first_error = ESP_OK;
     esp_err_t ret = ESP_OK;
     uint32_t waited_ms = 0U;
+    bool commit_lock_interrupted = false;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "controller is null");
@@ -482,16 +493,17 @@ static esp_err_t app_controller_stop_impl(app_controller_t *me,
     app_controller_capture_first_error(app_controller_unregister_event_handlers(me),
                                        &first_error);
 
-    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "take mutex failed after stop");
-        return first_error == ESP_OK ? ESP_ERR_TIMEOUT : first_error;
-    }
+    commit_lock_interrupted =
+        app_controller_take_state_mutex(me, "stop commit");
     if (from_start_rollback) {
         me->starting = false;
     }
     me->stopping = false;
     (void)xSemaphoreGive(me->mutex);
 
+    if (first_error == ESP_OK && commit_lock_interrupted) {
+        return ESP_ERR_TIMEOUT;
+    }
     return first_error;
 }
 
@@ -805,8 +817,7 @@ static esp_err_t app_controller_set_flag(app_controller_t *me, bool *flag,
                         "flag args are null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    (void)app_controller_take_state_mutex(me, "lifecycle flag update");
     *flag = value;
     (void)xSemaphoreGive(me->mutex);
 
@@ -820,13 +831,26 @@ static bool app_controller_get_flag(app_controller_t *me, const bool *flag)
     if (me == NULL || flag == NULL || me->mutex == NULL) {
         return false;
     }
-    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return false;
-    }
+    (void)app_controller_take_state_mutex(me, "lifecycle flag read");
     value = *flag;
     (void)xSemaphoreGive(me->mutex);
 
     return value;
+}
+
+static bool app_controller_take_state_mutex(app_controller_t *me,
+                                            const char *operation)
+{
+    bool interrupted = false;
+
+    while (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        if (!interrupted) {
+            ESP_LOGW(TAG, "%s mutex wait interrupted; retrying", operation);
+        }
+        interrupted = true;
+    }
+
+    return interrupted;
 }
 
 static esp_err_t app_controller_register_event_handlers(app_controller_t *me)

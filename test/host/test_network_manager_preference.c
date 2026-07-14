@@ -33,7 +33,19 @@ typedef struct {
     network_link_t base;
     network_rx_cb_t rx_cb;
     void *rx_ctx;
+    esp_err_t stop_ret;
+    int stop_calls;
 } fake_link_t;
+
+static int s_semaphore_delete_calls = 0;
+
+static esp_err_t fake_stop(network_link_t *base)
+{
+    fake_link_t *link = (fake_link_t *)base;
+
+    link->stop_calls++;
+    return link->stop_ret;
+}
 
 static esp_err_t fake_register_rx_cb(network_link_t *base,
                                      network_rx_cb_t cb, void *ctx)
@@ -46,6 +58,7 @@ static esp_err_t fake_register_rx_cb(network_link_t *base,
 }
 
 static const network_link_ops_t s_fake_ops = {
+    .stop = fake_stop,
     .register_rx_cb = fake_register_rx_cb,
 };
 
@@ -92,6 +105,7 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore)
 
 void vSemaphoreDelete(SemaphoreHandle_t semaphore)
 {
+    s_semaphore_delete_calls++;
     free(semaphore);
 }
 
@@ -141,12 +155,18 @@ static void init_fake_link(fake_link_t *link, network_link_type_t type)
     };
 }
 
+static void reset_spies(void)
+{
+    s_semaphore_delete_calls = 0;
+}
+
 static void test_backup_type_can_be_selected_as_preferred_primary(void)
 {
     fake_link_t wifi = {0};
     fake_link_t lte = {0};
     network_manager_t *manager = NULL;
 
+    reset_spies();
     init_fake_link(&wifi, NETWORK_LINK_TYPE_WIFI);
     init_fake_link(&lte, NETWORK_LINK_TYPE_LTE);
     const network_manager_config_t config = {
@@ -164,6 +184,7 @@ static void test_backup_type_can_be_selected_as_preferred_primary(void)
     assert(network_manager_destroy(manager) == ESP_OK);
     assert(lte.rx_cb == NULL);
     assert(wifi.rx_cb == NULL);
+    assert(s_semaphore_delete_calls == 2);
 }
 
 static void test_none_preserves_injected_primary(void)
@@ -172,6 +193,7 @@ static void test_none_preserves_injected_primary(void)
     fake_link_t lte = {0};
     network_manager_t *manager = NULL;
 
+    reset_spies();
     init_fake_link(&wifi, NETWORK_LINK_TYPE_WIFI);
     init_fake_link(&lte, NETWORK_LINK_TYPE_LTE);
     const network_manager_config_t config = {
@@ -185,12 +207,50 @@ static void test_none_preserves_injected_primary(void)
     assert(manager->primary == &wifi.base);
     assert(manager->backup == &lte.base);
     assert(network_manager_destroy(manager) == ESP_OK);
+    assert(s_semaphore_delete_calls == 2);
+}
+
+static void test_destroy_failure_preserves_handle_for_retry(void)
+{
+    fake_link_t wifi = {0};
+    fake_link_t lte = {0};
+    network_manager_t *manager = NULL;
+
+    reset_spies();
+    init_fake_link(&wifi, NETWORK_LINK_TYPE_WIFI);
+    init_fake_link(&lte, NETWORK_LINK_TYPE_LTE);
+    const network_manager_config_t config = {
+        .primary = &wifi.base,
+        .backup = &lte.base,
+        .preferred_primary = NETWORK_LINK_TYPE_WIFI,
+    };
+
+    manager = network_manager_create(&config);
+    assert(manager != NULL);
+    manager->started = true;
+    wifi.stop_ret = ESP_FAIL;
+
+    assert(network_manager_destroy(manager) == ESP_FAIL);
+    assert(s_semaphore_delete_calls == 0);
+    assert(manager->destroying == true);
+    assert(manager->stop_pending == true);
+    assert(wifi.stop_calls == 1);
+    assert(lte.stop_calls == 1);
+    assert(wifi.rx_cb == NULL);
+    assert(lte.rx_cb == NULL);
+
+    wifi.stop_ret = ESP_OK;
+    assert(network_manager_destroy(manager) == ESP_OK);
+    assert(wifi.stop_calls == 2);
+    assert(lte.stop_calls == 2);
+    assert(s_semaphore_delete_calls == 2);
 }
 
 int main(void)
 {
     test_backup_type_can_be_selected_as_preferred_primary();
     test_none_preserves_injected_primary();
+    test_destroy_failure_preserves_handle_for_retry();
 
     printf("network manager preference tests passed\n");
     return 0;

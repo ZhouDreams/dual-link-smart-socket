@@ -124,6 +124,13 @@ static esp_event_handler_instance_t s_startup_metering_handler_instance = NULL;
 static bool s_emit_metering_snapshot_during_startup_unregister = false;
 static metering_snapshot_t s_startup_handoff_metering_snapshot;
 static uint32_t s_task_delay_calls = 0U;
+static bool (*s_mutex_take_fail_hook)(SemaphoreHandle_t mutex) = NULL;
+static app_controller_t *s_stop_commit_controller = NULL;
+static bool s_fail_stop_commit_take_once = false;
+static bool s_fail_stop_flag_read_take_once = false;
+static int s_semaphore_delete_calls = 0;
+static int s_network_stop_calls = 0;
+static int s_network_stop_failures_remaining = 0;
 
 static void reset_host_state(void)
 {
@@ -144,6 +151,13 @@ static void reset_host_state(void)
     memset(&s_startup_handoff_metering_snapshot, 0,
            sizeof(s_startup_handoff_metering_snapshot));
     s_task_delay_calls = 0U;
+    s_mutex_take_fail_hook = NULL;
+    s_stop_commit_controller = NULL;
+    s_fail_stop_commit_take_once = false;
+    s_fail_stop_flag_read_take_once = false;
+    s_semaphore_delete_calls = 0;
+    s_network_stop_calls = 0;
+    s_network_stop_failures_remaining = 0;
 }
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
@@ -159,6 +173,9 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t ticks_to_wait)
     assert(host_mutex != NULL);
     assert(host_mutex->deleted == false);
     assert(host_mutex->locked == false);
+    if (s_mutex_take_fail_hook != NULL && s_mutex_take_fail_hook(mutex)) {
+        return pdFALSE;
+    }
     host_mutex->locked = true;
     return pdTRUE;
 }
@@ -183,6 +200,7 @@ void vSemaphoreDelete(SemaphoreHandle_t mutex)
     }
 
     host_mutex->deleted = true;
+    s_semaphore_delete_calls++;
     free(host_mutex);
 }
 
@@ -668,6 +686,12 @@ esp_err_t network_manager_stop(network_manager_t *me)
         return ESP_ERR_INVALID_ARG;
     }
 
+    s_network_stop_calls++;
+    if (s_network_stop_failures_remaining > 0) {
+        s_network_stop_failures_remaining--;
+        return ESP_FAIL;
+    }
+
     me->started = false;
     return ESP_OK;
 }
@@ -788,6 +812,32 @@ esp_err_t lvgl_dashboard_set_screen_enabled(lvgl_dashboard_t *me, bool enabled)
 
 #include "app_controller_internal.c"
 #include "app_controller.c"
+
+static bool fail_controller_stop_commit_once(SemaphoreHandle_t mutex)
+{
+    if (!s_fail_stop_commit_take_once || s_stop_commit_controller == NULL ||
+        mutex != s_stop_commit_controller->mutex ||
+        !s_stop_commit_controller->stopping ||
+        !app_controller_is_fully_stopped_locked(s_stop_commit_controller)) {
+        return false;
+    }
+
+    s_fail_stop_commit_take_once = false;
+    return true;
+}
+
+static bool fail_controller_stop_flag_read_once(SemaphoreHandle_t mutex)
+{
+    if (!s_fail_stop_flag_read_take_once || s_stop_commit_controller == NULL ||
+        mutex != s_stop_commit_controller->mutex ||
+        !s_stop_commit_controller->stopping ||
+        !s_stop_commit_controller->dashboard_started) {
+        return false;
+    }
+
+    s_fail_stop_flag_read_take_once = false;
+    return true;
+}
 
 static const char *handler_label(esp_event_handler_t handler)
 {
@@ -1149,6 +1199,102 @@ static void test_stop_times_out_while_start_remains_in_progress(void)
     assert(app_controller_destroy(controller) == ESP_OK);
 }
 
+static void test_stop_commit_interruption_restores_state(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    assert(app_controller_start(controller) == ESP_OK);
+
+    s_stop_commit_controller = controller;
+    s_fail_stop_commit_take_once = true;
+    s_mutex_take_fail_hook = fail_controller_stop_commit_once;
+    assert(app_controller_stop(controller) == ESP_ERR_TIMEOUT);
+    assert(s_fail_stop_commit_take_once == false);
+    assert(controller->stopping == false);
+    assert(app_controller_is_fully_stopped_locked(controller));
+
+    s_mutex_take_fail_hook = NULL;
+    s_stop_commit_controller = NULL;
+    assert(app_controller_destroy(controller) == ESP_OK);
+    assert(s_semaphore_delete_calls == 1);
+}
+
+static void test_destroy_failure_preserves_handle_for_retry(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    assert(app_controller_start(controller) == ESP_OK);
+
+    s_network_stop_failures_remaining = 1;
+    assert(app_controller_destroy(controller) == ESP_FAIL);
+    assert(s_semaphore_delete_calls == 0);
+    assert(s_network_stop_calls == 1);
+    assert(controller->net_mgr_started == true);
+    assert(controller->stopping == false);
+    assert(net_mgr.started == true);
+
+    assert(app_controller_destroy(controller) == ESP_OK);
+    assert(s_network_stop_calls == 2);
+    assert(s_semaphore_delete_calls == 1);
+}
+
+static void test_stop_flag_read_interruption_does_not_skip_cleanup(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    assert(app_controller_start(controller) == ESP_OK);
+
+    s_stop_commit_controller = controller;
+    s_fail_stop_flag_read_take_once = true;
+    s_mutex_take_fail_hook = fail_controller_stop_flag_read_once;
+    assert(app_controller_stop(controller) == ESP_OK);
+    assert(s_fail_stop_flag_read_take_once == false);
+    assert(dashboard.started == false);
+    assert(controller->dashboard_started == false);
+    assert(controller->stopping == false);
+    assert(app_controller_is_fully_stopped_locked(controller));
+
+    s_mutex_take_fail_hook = NULL;
+    s_stop_commit_controller = NULL;
+    assert(app_controller_destroy(controller) == ESP_OK);
+}
+
 int main(void)
 {
     test_metering_handler_runs_after_safety_handler();
@@ -1157,6 +1303,9 @@ int main(void)
     test_start_discards_startup_window_energy_delta_token();
     test_start_handoff_race_discards_metering_snapshot_token();
     test_stop_times_out_while_start_remains_in_progress();
+    test_stop_commit_interruption_restores_state();
+    test_destroy_failure_preserves_handle_for_retry();
+    test_stop_flag_read_interruption_does_not_skip_cleanup();
 
     printf("app controller event order tests passed\n");
     return 0;

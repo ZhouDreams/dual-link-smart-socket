@@ -117,6 +117,8 @@ esp_err_t metering_service_start(metering_service_t *me);
 /**
  * @brief 停止电参量服务
  * @details Stop a metering service
+ * @note 收尾 mutex 等待被中断时，本函数会先恢复一致状态；若此前无其它清理错误则返回 ESP_ERR_TIMEOUT，调用方可安全重试。
+ *       If the final mutex wait is interrupted, this function first restores a consistent state; it returns ESP_ERR_TIMEOUT when no earlier cleanup error takes precedence, and callers may safely retry.
  * @param[in] me 服务句柄
  * @return
  *         - ESP_OK: 成功

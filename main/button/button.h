@@ -90,13 +90,15 @@ button_t *button_create(const button_config_t *config);
  *       Caller must externally serialize destroy against button_register_cb and any other use of the same handle.
  * @note Espressif button 组件头文件应隔离在内部 button_iot_adapter 后面；
  *       Espressif button component headers should stay isolated behind the internal button_iot_adapter.
- * @note 仅 ESP_OK 表示句柄已被释放；失败时句柄及旧回调上下文仍须保持有效，不得继续普通访问。
- *       Only ESP_OK consumes the handle; on failure the handle and old callback contexts must remain valid and must not be used normally.
+ * @note ESP_ERR_TIMEOUT 发生在底层 delete 前，句柄及旧回调上下文仍须保持有效，可重试 destroy。
+ *       ESP_ERR_TIMEOUT occurs before the underlying delete; the handle and old callback contexts must remain valid so destroy can be retried.
+ * @note 当前 GPIO backend 对已校验 GPIO 的 delete 应返回 ESP_OK；若底层组件异常返回其它错误，其 ownership 状态未定义，调用方不得重用句柄。
+ *       The current GPIO backend should return ESP_OK for a validated GPIO; if the component unexpectedly returns another error, its ownership state is undefined and the handle must not be reused.
  * @param[in] me 按键句柄； Button handle
  * @return
  *         - ESP_OK: 成功； Success
- *         - ESP_FAIL: 删除底层按键失败； Underlying button delete failed
  *         - ESP_ERR_TIMEOUT: 等待互斥量或在途回调超时； Mutex or in-flight callback timeout
+ *         - 其他: 底层按键进入未定义的部分销毁状态； Other errors indicate an undefined partially destroyed underlying button
  */
 esp_err_t button_destroy(button_t *me);
 

@@ -311,6 +311,7 @@ esp_err_t metering_service_stop(metering_service_t *me)
     esp_event_handler_instance_t fault_handler = NULL;
     bool measurement_unregistered = false;
     bool fault_unregistered = false;
+    bool commit_lock_interrupted = false;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "service is null");
@@ -363,8 +364,12 @@ esp_err_t metering_service_stop(metering_service_t *me)
         }
     }
 
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    while (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        if (!commit_lock_interrupted) {
+            ESP_LOGW(TAG, "stop commit mutex wait interrupted; retrying");
+        }
+        commit_lock_interrupted = true;
+    }
     if (measurement_unregistered &&
         me->measurement_handler == measurement_handler) {
         me->measurement_handler = NULL;
@@ -378,6 +383,9 @@ esp_err_t metering_service_stop(metering_service_t *me)
     me->stopping = false;
     (void)xSemaphoreGive(me->mutex);
 
+    if (first_error == ESP_OK && commit_lock_interrupted) {
+        return ESP_ERR_TIMEOUT;
+    }
     return first_error;
 }
 

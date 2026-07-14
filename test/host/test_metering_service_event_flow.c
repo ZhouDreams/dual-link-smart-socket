@@ -24,6 +24,11 @@ static size_t s_last_event_size = 0;
 static int64_t s_fake_time_us = 0;
 static void (*s_event_post_hook)(void) = NULL;
 static void *s_event_post_hook_ctx = NULL;
+static int32_t s_fail_unregister_event_id = -1;
+static int s_unregister_failures_remaining = 0;
+static int s_unregister_calls = 0;
+static bool s_fail_stop_commit_take_once = false;
+static int s_semaphore_delete_calls = 0;
 
 esp_event_base_t BL0942_EVENT_BASE = "BL0942_EVENT_BASE";
 
@@ -40,6 +45,10 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t ticks_to_wait)
     assert(host_mutex != NULL);
     assert(host_mutex->deleted == false);
     assert(host_mutex->locked == false);
+    if (s_fail_stop_commit_take_once && s_unregister_calls >= 2) {
+        s_fail_stop_commit_take_once = false;
+        return pdFALSE;
+    }
     host_mutex->locked = true;
     return pdTRUE;
 }
@@ -64,6 +73,7 @@ void vSemaphoreDelete(SemaphoreHandle_t mutex)
     }
 
     host_mutex->deleted = true;
+    s_semaphore_delete_calls++;
     free(host_mutex);
 }
 
@@ -102,8 +112,14 @@ esp_err_t esp_event_handler_instance_unregister(
     esp_event_handler_instance_t instance)
 {
     (void)event_base;
-    (void)event_id;
     (void)instance;
+
+    s_unregister_calls++;
+    if (event_id == s_fail_unregister_event_id &&
+        s_unregister_failures_remaining > 0) {
+        s_unregister_failures_remaining--;
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -188,6 +204,11 @@ static void reset_spies(void)
     s_fake_time_us = 0;
     s_event_post_hook = NULL;
     s_event_post_hook_ctx = NULL;
+    s_fail_unregister_event_id = -1;
+    s_unregister_failures_remaining = 0;
+    s_unregister_calls = 0;
+    s_fail_stop_commit_take_once = false;
+    s_semaphore_delete_calls = 0;
     memset(s_last_event_data, 0, sizeof(s_last_event_data));
 }
 
@@ -403,6 +424,49 @@ static void test_fault_with_hard_reset_rebaselines(void)
     destroy_service_fixture(&service);
 }
 
+static void test_stop_commit_interruption_restores_state(void)
+{
+    metering_service_t *service = NULL;
+
+    reset_spies();
+    service = metering_service_create(NULL);
+    assert(service != NULL);
+    assert(metering_service_start(service) == ESP_OK);
+
+    s_fail_stop_commit_take_once = true;
+    assert(metering_service_stop(service) == ESP_ERR_TIMEOUT);
+    assert(s_fail_stop_commit_take_once == false);
+    assert(service->measurement_handler == NULL);
+    assert(service->fault_handler == NULL);
+    assert(service->started == false);
+    assert(service->stopping == false);
+
+    assert(metering_service_destroy(service) == ESP_OK);
+    assert(s_semaphore_delete_calls == 1);
+}
+
+static void test_destroy_failure_preserves_handle_for_retry(void)
+{
+    metering_service_t *service = NULL;
+
+    reset_spies();
+    service = metering_service_create(NULL);
+    assert(service != NULL);
+    assert(metering_service_start(service) == ESP_OK);
+
+    s_fail_unregister_event_id = BL0942_EVENT_MEASUREMENT;
+    s_unregister_failures_remaining = 1;
+    assert(metering_service_destroy(service) == ESP_FAIL);
+    assert(s_semaphore_delete_calls == 0);
+    assert(service->measurement_handler != NULL);
+    assert(service->fault_handler == NULL);
+    assert(service->started == true);
+    assert(service->stopping == false);
+
+    assert(metering_service_destroy(service) == ESP_OK);
+    assert(s_semaphore_delete_calls == 1);
+}
+
 int main(void)
 {
     test_post_failure_discards_pending_token();
@@ -410,6 +474,8 @@ int main(void)
     test_fault_without_hard_reset_preserves_confirmed_baseline();
     test_fault_without_hard_reset_clears_pending_token_only();
     test_fault_with_hard_reset_rebaselines();
+    test_stop_commit_interruption_restores_state();
+    test_destroy_failure_preserves_handle_for_retry();
 
     printf("metering event flow tests passed\n");
     return 0;
