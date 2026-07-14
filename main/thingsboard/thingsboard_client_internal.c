@@ -313,11 +313,24 @@ esp_err_t tb_internal_format_power_limit_attribute(char *buf, size_t buf_size,
 }
 
 esp_err_t tb_internal_format_power_limit_response(char *buf, size_t buf_size,
-                                                  float power_limit_w,
-                                                  size_t *out_len)
+                                                   float power_limit_w,
+                                                   size_t *out_len)
 {
     return tb_internal_format_power_limit_attribute(buf, buf_size,
-                                                   power_limit_w, out_len);
+                                                    power_limit_w, out_len);
+}
+
+esp_err_t tb_internal_format_rpc_error_response(char *buf, size_t buf_size,
+                                                size_t *out_len)
+{
+    int written;
+
+    if ((buf == NULL) || (buf_size == 0U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    written = snprintf(buf, buf_size, "{\"error\":\"internal_error\"}");
+    return finish_format(written, buf_size, out_len);
 }
 
 esp_err_t tb_internal_format_rpc_response_topic(char *buf, size_t buf_size,

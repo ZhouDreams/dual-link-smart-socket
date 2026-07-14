@@ -13,7 +13,6 @@
 #include "app_controller.h"
 
 #include <stdlib.h>
-#include <string.h>
 
 #include "app_controller_internal.h"
 #include "esp_check.h"
@@ -27,7 +26,6 @@
  *********************/
 
 #define TAG "app_controller"
-#define APP_CONTROLLER_RPC_BUF_SIZE (96)
 #define APP_CONTROLLER_LIFECYCLE_POLL_MS (10U)
 #define APP_CONTROLLER_LIFECYCLE_TIMEOUT_MS (5000U)
 
@@ -695,8 +693,6 @@ static void app_controller_on_tb_command(const tb_command_t *cmd,
     app_controller_t *me = (app_controller_t *)user_ctx;
     float current_a = 0.0f;
     float power = 0.0f;
-    char response[APP_CONTROLLER_RPC_BUF_SIZE];
-    size_t response_len = 0U;
     esp_err_t ret = ESP_OK;
 
     if (cmd == NULL || !app_controller_is_running(me)) {
@@ -714,14 +710,16 @@ static void app_controller_on_tb_command(const tb_command_t *cmd,
     case TB_COMMAND_GET_POWER_LIMIT:
         ret = safety_guard_get_thresholds(me->cfg.safety, NULL, &power);
         if (ret == ESP_OK) {
-            ret = app_controller_internal_format_power_limit_response(
-                response, sizeof(response), power, &response_len);
+            ret = thingsboard_client_send_power_limit_response(
+                me->cfg.tb, cmd->request_id, power);
         }
-        if (ret == ESP_OK) {
-            ret = thingsboard_client_send_rpc_response(me->cfg.tb,
-                                                       cmd->request_id,
-                                                       response,
-                                                       response_len);
+        if (ret != ESP_OK) {
+            const esp_err_t response_ret = thingsboard_client_send_rpc_error(
+                me->cfg.tb, cmd->request_id);
+            if (response_ret != ESP_OK) {
+                ESP_LOGW(TAG, "send RPC error response failed: %s",
+                         esp_err_to_name(response_ret));
+            }
         }
         break;
     case TB_COMMAND_SET_POWER_LIMIT:
@@ -1257,7 +1255,7 @@ static esp_err_t app_controller_publish_telemetry(
             }
         }
         s_telemetry_publish_count++;
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "telemetry publish #%lu ok: V=%.2fV I=%.3fA P=%.2fW E=%.3fmWh F=%.2fHz valid=%d link=%s",
                  (unsigned long)s_telemetry_publish_count,
                  (double)input.voltage,

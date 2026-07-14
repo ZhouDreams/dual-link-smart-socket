@@ -1711,6 +1711,7 @@ struct lvgl_dashboard {
     SemaphoreHandle_t lvgl_task_done_sema;
     portMUX_TYPE flush_lock;
     esp_timer_handle_t tick_timer;
+    lvgl_dashboard_timer_barrier_t tick_barrier;
     lvgl_dashboard_tick_ctx_t *tick_ctx;
     void *draw_buf_1;
     void *draw_buf_2;
@@ -1741,7 +1742,19 @@ struct lvgl_dashboard {
     bool lvgl_initialized_by_me;
     bool flush_cb_registered;
     bool tick_timer_started;
+    bool tick_drain_pending;
 };
+```
+
+私有 timer barrier 状态定义在 `lvgl_dashboard_timer_barrier.h`，仅供 dashboard 实现使用：
+
+```c
+typedef struct {
+    esp_timer_handle_t timer;
+    SemaphoreHandle_t done_sema;
+    bool started;
+    bool completed;
+} lvgl_dashboard_timer_barrier_t;
 ```
 
 ### 12.5 数据流
@@ -1765,6 +1778,9 @@ SAFETY_GUARD_EVENT_SNAPSHOT → event_handler ──→ 更新 state_cache (mute
 - 直接订阅业务事件的 esp_event，不需要 `display_service` 中间层
 - 网络状态通过 `network_manager_get_status()` 在 LVGL task loop 中轮询
 - `set_screen_enabled(false)` → 背光关闭。`set_screen_enabled(true)` → 背光打开
+- tick timer 显式使用 `ESP_TIMER_TASK` dispatch；停止后通过同一 timer task 的 one-shot barrier 等待此前已派发回调完成，再删除 timer 和释放 `tick_ctx`
+- `tick_drain_pending` 从 periodic timer 成功启动保持到 barrier 完成；barrier 超时或创建失败时保留 timer、semaphore、上下文和进度标志，供后续 destroy 重试
+- `tick_drain_pending=true` 时 `start()` 返回 `ESP_ERR_INVALID_STATE`，`stop()` 不得走已停止快速路径；必须先重试完成旧 barrier，防止新旧 timer 周期复用同一上下文
 - `lvgl_dashboard_create()` 内部初始化 LVGL 库、创建显示对象、构建控件树
 - `lvgl_dashboard_destroy()` 清理控件树、释放 LVGL 资源、停止 LVGL task
 
@@ -1887,8 +1903,12 @@ esp_err_t thingsboard_client_report_relay_state(thingsboard_client_t *me, bool o
 esp_err_t thingsboard_client_report_power_limit(thingsboard_client_t *me,
                                                  float power_limit_w);
 esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
-                                                int32_t request_id,
-                                                const char *json, size_t json_len);
+                                                 int32_t request_id,
+                                                 const char *json, size_t json_len);
+esp_err_t thingsboard_client_send_power_limit_response(
+    thingsboard_client_t *me, int32_t request_id, float power_limit_w);
+esp_err_t thingsboard_client_send_rpc_error(thingsboard_client_t *me,
+                                             int32_t request_id);
 
 // 下行
 esp_err_t thingsboard_client_register_command_cb(thingsboard_client_t *me,
@@ -1925,6 +1945,8 @@ rpc_request:  v1/devices/me/rpc/request/+
 rpc_response: v1/devices/me/rpc/response/{request_id}
 ```
 
+`GET_POWER_LIMIT` 响应载荷契约：成功返回 `{"powerLimit":<watts>}`；业务读取或成功响应格式化失败时返回 `{"error":"internal_error"}`。若底层网络发布本身失败，调用方记录错误，无法保证平台收到响应。
+
 ### 13.7 数据流
 
 ```
@@ -1953,6 +1975,7 @@ cmd_cb(cmd, ctx)  →  app_controller  →  relay_set() / safety_guard_set_thres
 - `start()` 通过 `network_manager_subscribe()` 注册 RPC 和属性 topic；通过 `network_manager_register_rx_cb()` 注册下行回调
 - `publish_telemetry()` 内部构建 JSON 后调用 `network_manager_publish()`，不直接依赖 `wifi_link` 或 `lte_link`
 - `report_relay_state()` 和 `report_power_limit()` 是快捷方法，内部构建 attribute JSON 并 publish
+- `send_power_limit_response()` 和 `send_rpc_error()` 是 RPC 语义方法，响应 JSON 只在 ThingsBoard 模块内部构建；上层不得引用 `thingsboard_client_internal.h`
 - RPC 响应 topic 格式为 `v1/devices/me/rpc/response/{request_id}`
 - 不依赖旧项目的 `feature_engineering_t`、`load_class_t`、`risk_score`、`risk_model`——纯业务语义
 - `json_buf` 是预分配缓冲区，telemetry JSON 在栈上构建后通过 `network_manager_publish` 发出
@@ -2266,9 +2289,16 @@ static void on_tb_command(const tb_command_t *cmd, void *ctx) {
         thingsboard_client_report_relay_state(app->cfg.tb, cmd->relay_on);
         break;
     case TB_COMMAND_GET_POWER_LIMIT: {
-        float threshold = /* 从 safety_guard 读取当前阈值 */;
-        thingsboard_client_send_rpc_response(app->cfg.tb,
-            cmd->request_id, response_json, len);
+        float threshold = 0.0f;
+        esp_err_t ret = safety_guard_get_thresholds(app->cfg.safety, NULL,
+                                                     &threshold);
+        if (ret == ESP_OK) {
+            ret = thingsboard_client_send_power_limit_response(
+                app->cfg.tb, cmd->request_id, threshold);
+        }
+        if (ret != ESP_OK) {
+            thingsboard_client_send_rpc_error(app->cfg.tb, cmd->request_id);
+        }
         break;
     }
     case TB_COMMAND_SET_POWER_LIMIT:
@@ -2341,6 +2371,8 @@ void app_main(void) {
 - `start()` 按依赖顺序注册所有回调 + 启动子模块
 - 自身不在 esp_event 上发事件，只做订阅和协调
 - 每条数据流（按键→继电器、安全→继电器、电参量→TB、TB命令→继电器）都在 `app_controller.c` 中以回调函数实现，集中可见
+- `app_controller` 只依赖各模块公共头文件；RPC JSON 格式化和 topic 规则由 `thingsboard_client` 封装
+- 1 Hz 遥测成功详情只使用 debug 日志；warning/error 保留在发布和确认失败路径
 - `main.c` 是唯一的对象创建点，所有装配关系一目了然
 
 ---

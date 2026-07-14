@@ -145,8 +145,15 @@ esp_err_t tb_internal_format_power_limit_attribute(char *buf, size_t buf_size,
  * @details Format power limit RPC response JSON
  */
 esp_err_t tb_internal_format_power_limit_response(char *buf, size_t buf_size,
-                                                  float power_limit_w,
-                                                  size_t *out_len);
+                                                   float power_limit_w,
+                                                   size_t *out_len);
+
+/**
+ * @brief 格式化内部错误 RPC 响应 JSON
+ * @details Format internal-error RPC response JSON
+ */
+esp_err_t tb_internal_format_rpc_error_response(char *buf, size_t buf_size,
+                                                size_t *out_len);
 
 /**
  * @brief 格式化 RPC 响应主题

@@ -84,6 +84,15 @@ mkdir -p "${BUILD_DIR}"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/display/lvgl" \
+    "${ROOT_DIR}/main/display/lvgl/lvgl_dashboard_timer_barrier.c" \
+    "${ROOT_DIR}/test/host/test_lvgl_dashboard_timer_barrier.c" \
+    -o "${BUILD_DIR}/test_lvgl_dashboard_timer_barrier"
+
+"${BUILD_DIR}/test_lvgl_dashboard_timer_barrier"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/metering" \
     "${ROOT_DIR}/main/metering/metering_service_internal.c" \
     "${ROOT_DIR}/test/host/test_metering_service_internal.c" \
@@ -111,8 +120,6 @@ mkdir -p "${BUILD_DIR}"
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/app" \
-    -I"${ROOT_DIR}/main/thingsboard" \
-    "${ROOT_DIR}/main/thingsboard/thingsboard_client_internal.c" \
     "${ROOT_DIR}/main/app/app_controller_internal.c" \
     "${ROOT_DIR}/test/host/test_app_controller_internal.c" \
     -o "${BUILD_DIR}/test_app_controller_internal"

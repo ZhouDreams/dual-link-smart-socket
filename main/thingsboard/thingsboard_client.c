@@ -33,6 +33,7 @@
 #define TB_STOP_TIMEOUT_MS       (5000U)
 #define TB_COMMAND_DRAIN_POLL_MS (10U)
 #define TB_COMMAND_DRAIN_TIMEOUT_MS (5000U)
+#define TB_RPC_RESPONSE_BUF_SIZE (96U)
 
 /**********************
  *      TYPEDEFS
@@ -555,6 +556,41 @@ esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
     }
 
     return thingsboard_client_publish_json(net_mgr, topic, json, json_len);
+}
+
+esp_err_t thingsboard_client_send_power_limit_response(
+    thingsboard_client_t *me, int32_t request_id, float power_limit_w)
+{
+    char response[TB_RPC_RESPONSE_BUF_SIZE];
+    size_t response_len = 0U;
+
+    ESP_RETURN_ON_FALSE(power_limit_w > 0.0f, ESP_ERR_INVALID_ARG, TAG,
+                        "power limit must be positive");
+
+    esp_err_t ret = tb_internal_format_power_limit_response(
+        response, sizeof(response), power_limit_w, &response_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return thingsboard_client_send_rpc_response(me, request_id, response,
+                                                response_len);
+}
+
+esp_err_t thingsboard_client_send_rpc_error(thingsboard_client_t *me,
+                                            int32_t request_id)
+{
+    char response[TB_RPC_RESPONSE_BUF_SIZE];
+    size_t response_len = 0U;
+
+    esp_err_t ret = tb_internal_format_rpc_error_response(
+        response, sizeof(response), &response_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return thingsboard_client_send_rpc_response(me, request_id, response,
+                                                response_len);
 }
 
 esp_err_t thingsboard_client_register_command_cb(thingsboard_client_t *me,

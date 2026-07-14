@@ -63,30 +63,12 @@ static void test_energy_delta_token_presence(void)
     assert(app_controller_internal_has_energy_delta_token(false, 1U) == false);
 }
 
-static void test_power_limit_response(void)
-{
-    char buf[64];
-    size_t out_len = 0;
-
-    assert(app_controller_internal_format_power_limit_response(buf,
-                                                               sizeof(buf),
-                                                               1800.0f,
-                                                               &out_len) == ESP_OK);
-    assert(strcmp(buf, "{\"powerLimit\":1800.00}") == 0);
-    assert(out_len == strlen(buf));
-    assert(app_controller_internal_format_power_limit_response(buf,
-                                                               sizeof(buf),
-                                                               0.0f,
-                                                               &out_len) == ESP_ERR_INVALID_ARG);
-}
-
 int main(void)
 {
     test_link_names();
     test_toggle_screen();
     test_build_telemetry();
     test_energy_delta_token_presence();
-    test_power_limit_response();
 
     printf("app controller internal tests passed\n");
 

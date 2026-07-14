@@ -200,6 +200,41 @@ esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
                                                size_t json_len);
 
 /**
+ * @brief 发送功率限制 RPC 响应
+ * @details Send power-limit RPC response
+ * @note ESP_OK 仅表示底层发布请求已接受，不保证 ThingsBoard 已收到；其它底层发布错误会原样返回。
+ *       ESP_OK only means the lower publish request was accepted, not that ThingsBoard received it; other lower-layer publish errors are propagated.
+ * @param[in] me ThingsBoard 客户端句柄； ThingsBoard client handle
+ * @param[in] request_id RPC 请求 ID； RPC request ID
+ * @param[in] power_limit_w 功率限制 W； Power limit in watts
+ * @return
+ *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_INVALID_SIZE: 响应缓冲区不足； Response buffer too small
+ */
+esp_err_t thingsboard_client_send_power_limit_response(
+    thingsboard_client_t *me, int32_t request_id, float power_limit_w);
+
+/**
+ * @brief 发送内部错误 RPC 响应
+ * @details Send internal-error RPC response
+ * @note 响应载荷固定为 {"error":"internal_error"}。
+ *       The response payload is fixed to {"error":"internal_error"}.
+ * @note ESP_OK 仅表示底层发布请求已接受，不保证 ThingsBoard 已收到；其它底层发布错误会原样返回。
+ *       ESP_OK only means the lower publish request was accepted, not that ThingsBoard received it; other lower-layer publish errors are propagated.
+ * @param[in] me ThingsBoard 客户端句柄； ThingsBoard client handle
+ * @param[in] request_id RPC 请求 ID； RPC request ID
+ * @return
+ *         - ESP_OK: 成功； Success
+ *         - ESP_ERR_INVALID_ARG: 参数无效； Invalid argument
+ *         - ESP_ERR_INVALID_STATE: 状态无效； Invalid state
+ *         - ESP_ERR_INVALID_SIZE: 响应缓冲区不足； Response buffer too small
+ */
+esp_err_t thingsboard_client_send_rpc_error(thingsboard_client_t *me,
+                                            int32_t request_id);
+
+/**
  * @brief 注册命令回调
  * @details Register command callback
  * @param[in] me ThingsBoard 客户端句柄； ThingsBoard client handle

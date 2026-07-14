@@ -23,6 +23,10 @@
 | MS-02 / app M2：stop 收尾 mutex 中断后遗留 `stopping` | 已修复 | 重试取得收尾锁、恢复一致状态后返回超时 + app/metering lifecycle tests |
 | network_manager C-1/C-2：持状态锁调用链路 API、RX 事件任务无限等待 | 已修复 | 独立 control mutex + 链路调用移出短状态锁 + RX 有限等待和原子 callback drain tests |
 | BL0942-MUTEX-DELAY：hard reset 持缓存锁约 2 秒 | 已修复 | 拆分 cache/io mutex，复位仅独占 UART I/O；reset locking test 验证缓存读取不受阻塞 |
+| app_controller M6：引用 thingsboard_client 内部头 | 已修复 | 功率阈值和错误响应提升为 ThingsBoard 公共语义 API；app 模块不再 include 内部头 |
+| app_controller M5：GET_POWER_LIMIT 失败不返回 RPC 错误 | 已修复 | 成功返回 powerLimit；读取或成功响应失败时尝试返回固定 internal_error JSON + command tests |
+| app_controller M4：1 Hz 成功遥测使用 ESP_LOGI | 已修复 | 成功详情降为 ESP_LOGD；失败路径继续使用 warning |
+| LVGL M1：tick_ctx 每次 destroy 泄漏 | 已修复 | ESP_TIMER_TASK one-shot dispatch barrier + 超时保留/重试测试；确认回调清空后释放 tick_ctx |
 
 ## 生命周期台账核对
 
@@ -35,15 +39,10 @@
 
 ## 仍需处理
 
-| 优先级 | 问题 | 当前判断 |
-|--------|------|----------|
-| P3 | app_controller M6：引用 thingsboard_client 内部头 | 应把响应格式化提升为公共 API 或由 ThingsBoard 层封装 |
-| P3 | app_controller M5：GET_POWER_LIMIT 失败不返回 RPC 错误 | 需先定义 ThingsBoard 错误响应格式 |
-| P4 | app_controller M4：1 Hz 成功遥测使用 ESP_LOGI | 应降为 debug 或抽样日志 |
-| P4 | LVGL M1：tick_ctx 每次 destroy 泄漏约 20 字节 | 需确认 ESP-IDF 6.0 `esp_timer_stop_blocking` 契约后修复 |
+当前台账中的 P0-P4 实际修复项均已关闭。
 
 ## 验证边界
 
-- Host tests 覆盖状态机、失败重试、事件顺序和 ST7789T 命令值。
+- Host tests 覆盖状态机、失败重试、事件顺序、RPC 响应、timer barrier 和 ST7789T 命令值。
 - ESP-IDF 全量构建用于验证目标头文件和组件 API 兼容性。
 - LTE/Wi-Fi 实际切换时延、TFT 颜色方向和安全关断时延仍需实机验证。

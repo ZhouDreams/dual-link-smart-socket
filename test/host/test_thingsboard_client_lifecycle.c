@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -24,6 +25,10 @@ static unsigned int s_unsubscribe_calls = 0U;
 static unsigned int s_mutex_delete_calls = 0U;
 static network_rx_cb_t s_rx_cb = NULL;
 static void *s_rx_ctx = NULL;
+static esp_err_t s_publish_ret = ESP_OK;
+static unsigned int s_publish_calls = 0U;
+static char s_published_topic[128];
+static char s_published_payload[128];
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
 {
@@ -108,8 +113,19 @@ esp_err_t network_manager_publish(network_manager_t *me,
                                   const network_publish_request_t *req)
 {
     (void)me;
-    (void)req;
-    return ESP_OK;
+
+    assert(req != NULL);
+    assert(req->topic != NULL);
+    assert(req->payload != NULL || req->payload_len == 0U);
+    assert(strlen(req->topic) < sizeof(s_published_topic));
+    assert(req->payload_len < sizeof(s_published_payload));
+    s_publish_calls++;
+    strcpy(s_published_topic, req->topic);
+    if (req->payload_len > 0U) {
+        memcpy(s_published_payload, req->payload, req->payload_len);
+    }
+    s_published_payload[req->payload_len] = '\0';
+    return s_publish_ret;
 }
 
 #include "thingsboard_client_internal.c"
@@ -193,10 +209,55 @@ static void test_destroy_retries_failed_unsubscribe_before_free(void)
     assert(s_mutex_delete_calls == 1U);
 }
 
+static void test_semantic_rpc_responses_format_and_publish(void)
+{
+    network_manager_t manager = {0};
+    const tb_client_config_t config = {
+        .net_mgr = &manager,
+        .json_buf_size = 128,
+    };
+    thingsboard_client_t *client = NULL;
+
+    s_publish_ret = ESP_OK;
+    s_publish_calls = 0U;
+    memset(s_published_topic, 0, sizeof(s_published_topic));
+    memset(s_published_payload, 0, sizeof(s_published_payload));
+    client = thingsboard_client_create(&config);
+    assert(client != NULL);
+
+    assert(thingsboard_client_send_power_limit_response(client, 22,
+                                                        1500.0f) == ESP_OK);
+    assert(s_publish_calls == 1U);
+    assert(strcmp(s_published_topic,
+                  "v1/devices/me/rpc/response/22") == 0);
+    assert(strcmp(s_published_payload,
+                  "{\"powerLimit\":1500.00}") == 0);
+
+    assert(thingsboard_client_send_rpc_error(client, 23) == ESP_OK);
+    assert(s_publish_calls == 2U);
+    assert(strcmp(s_published_topic,
+                  "v1/devices/me/rpc/response/23") == 0);
+    assert(strcmp(s_published_payload,
+                  "{\"error\":\"internal_error\"}") == 0);
+
+    assert(thingsboard_client_send_power_limit_response(client, 24, 0.0f) ==
+           ESP_ERR_INVALID_ARG);
+    assert(thingsboard_client_send_rpc_error(client, -1) ==
+           ESP_ERR_INVALID_ARG);
+    assert(s_publish_calls == 2U);
+
+    s_publish_ret = ESP_FAIL;
+    assert(thingsboard_client_send_power_limit_response(client, 25,
+                                                        1600.0f) == ESP_FAIL);
+    assert(s_publish_calls == 3U);
+    assert(thingsboard_client_destroy(client) == ESP_OK);
+}
+
 int main(void)
 {
     test_destroy_retries_network_rx_drain_before_free();
     test_destroy_retries_failed_unsubscribe_before_free();
+    test_semantic_rpc_responses_format_and_publish();
 
     printf("thingsboard client lifecycle tests passed\n");
     return 0;

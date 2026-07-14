@@ -22,6 +22,7 @@ idf_component_register(
         "display/tft/tft_panel.c"
         "display/tft/tft_panel_st7789t.c"
         "display/lvgl/lvgl_dashboard_internal.c"
+        "display/lvgl/lvgl_dashboard_timer_barrier.c"
         "display/lvgl/lvgl_dashboard.c"
     INCLUDE_DIRS
         "."

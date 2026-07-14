@@ -14,8 +14,6 @@
 
 #include <string.h>
 
-#include "thingsboard_client_internal.h"
-
 /*********************
  *      DEFINES
  *********************/
@@ -89,17 +87,6 @@ void app_controller_internal_build_telemetry(
     out->safety_level = source->safety_valid ? source->safety_level :
                         SAFETY_GUARD_LEVEL_WARNING;
     out->valid = source->metering_valid;
-}
-
-esp_err_t app_controller_internal_format_power_limit_response(
-    char *buf, size_t buf_size, float power_limit_w, size_t *out_len)
-{
-    if (power_limit_w <= 0.0f) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    return tb_internal_format_power_limit_response(buf, buf_size,
-                                                   power_limit_w, out_len);
 }
 
 /**********************

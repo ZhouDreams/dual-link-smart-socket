@@ -21,7 +21,6 @@
 #include "relay.h"
 #include "safety_guard.h"
 #include "thingsboard_client.h"
-#include "thingsboard_client_internal.h"
 
 static void host_log_sink(const char *tag, const char *fmt, ...)
 {
@@ -131,6 +130,13 @@ static bool s_fail_stop_flag_read_take_once = false;
 static int s_semaphore_delete_calls = 0;
 static int s_network_stop_calls = 0;
 static int s_network_stop_failures_remaining = 0;
+static esp_err_t s_safety_get_thresholds_ret = ESP_OK;
+static esp_err_t s_power_limit_response_ret = ESP_OK;
+static esp_err_t s_rpc_error_response_ret = ESP_OK;
+static int s_power_limit_response_calls = 0;
+static int s_rpc_error_response_calls = 0;
+static int32_t s_last_rpc_request_id = -1;
+static float s_last_rpc_power_limit_w = 0.0f;
 
 static void reset_host_state(void)
 {
@@ -158,6 +164,13 @@ static void reset_host_state(void)
     s_semaphore_delete_calls = 0;
     s_network_stop_calls = 0;
     s_network_stop_failures_remaining = 0;
+    s_safety_get_thresholds_ret = ESP_OK;
+    s_power_limit_response_ret = ESP_OK;
+    s_rpc_error_response_ret = ESP_OK;
+    s_power_limit_response_calls = 0;
+    s_rpc_error_response_calls = 0;
+    s_last_rpc_request_id = -1;
+    s_last_rpc_power_limit_w = 0.0f;
 }
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
@@ -366,31 +379,6 @@ const char *esp_err_to_name(esp_err_t err)
     default:
         return "ESP_ERR_UNKNOWN";
     }
-}
-
-esp_err_t tb_internal_format_power_limit_response(char *buf, size_t buf_size,
-                                                  float power_limit_w,
-                                                  size_t *out_len)
-{
-    int written = 0;
-
-    if (buf == NULL || buf_size == 0U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    written = snprintf(buf, buf_size, "{\"powerLimit\":%.2f}",
-                       (double)power_limit_w);
-    if (written < 0) {
-        return ESP_FAIL;
-    }
-    if ((size_t)written >= buf_size) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (out_len != NULL) {
-        *out_len = (size_t)written;
-    }
-
-    return ESP_OK;
 }
 
 static void host_test_safety_metering_handler(void *handler_args,
@@ -648,6 +636,9 @@ esp_err_t safety_guard_get_thresholds(safety_guard_t *me,
     if (me == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_safety_get_thresholds_ret != ESP_OK) {
+        return s_safety_get_thresholds_ret;
+    }
     if (out_overcurrent_a != NULL) {
         *out_overcurrent_a = me->overcurrent_a;
     }
@@ -755,16 +746,25 @@ esp_err_t thingsboard_client_report_power_limit(thingsboard_client_t *me,
     return ESP_OK;
 }
 
-esp_err_t thingsboard_client_send_rpc_response(thingsboard_client_t *me,
-                                               int32_t request_id,
-                                               const char *json,
-                                               size_t json_len)
+esp_err_t thingsboard_client_send_power_limit_response(
+    thingsboard_client_t *me, int32_t request_id, float power_limit_w)
 {
     (void)me;
-    (void)request_id;
-    (void)json;
-    (void)json_len;
-    return ESP_OK;
+
+    s_power_limit_response_calls++;
+    s_last_rpc_request_id = request_id;
+    s_last_rpc_power_limit_w = power_limit_w;
+    return s_power_limit_response_ret;
+}
+
+esp_err_t thingsboard_client_send_rpc_error(thingsboard_client_t *me,
+                                            int32_t request_id)
+{
+    (void)me;
+
+    s_rpc_error_response_calls++;
+    s_last_rpc_request_id = request_id;
+    return s_rpc_error_response_ret;
 }
 
 esp_err_t thingsboard_client_register_command_cb(thingsboard_client_t *me,
@@ -1073,6 +1073,63 @@ static void test_metering_register_failure_rolls_back_handlers(void)
     assert(app_controller_destroy(controller) == ESP_OK);
 }
 
+static void test_get_power_limit_rpc_sends_success_or_error_response(void)
+{
+    relay_t relay = {0};
+    button_t button = {0};
+    bl0942_t bl0942 = {0};
+    metering_service_t metering = {0};
+    safety_guard_t safety = {0};
+    thingsboard_client_t tb = {0};
+    network_manager_t net_mgr = {0};
+    lvgl_dashboard_t dashboard = {0};
+    app_controller_t *controller = NULL;
+    tb_command_t command = {
+        .type = TB_COMMAND_GET_POWER_LIMIT,
+        .request_id = 41,
+    };
+
+    reset_host_state();
+    controller = create_controller_fixture(&relay, &button, &bl0942, &metering,
+                                           &safety, &tb, &net_mgr, &dashboard);
+    assert(controller != NULL);
+    safety.overpower_w = 1800.0f;
+    assert(app_controller_start(controller) == ESP_OK);
+    assert(tb.cmd_cb != NULL);
+
+    tb.cmd_cb(&command, tb.cmd_ctx);
+    assert(s_power_limit_response_calls == 1);
+    assert(s_rpc_error_response_calls == 0);
+    assert(s_last_rpc_request_id == 41);
+    assert(s_last_rpc_power_limit_w == 1800.0f);
+
+    command.request_id = 42;
+    s_safety_get_thresholds_ret = ESP_FAIL;
+    tb.cmd_cb(&command, tb.cmd_ctx);
+    assert(s_power_limit_response_calls == 1);
+    assert(s_rpc_error_response_calls == 1);
+    assert(s_last_rpc_request_id == 42);
+
+    command.request_id = 43;
+    s_safety_get_thresholds_ret = ESP_OK;
+    s_power_limit_response_ret = ESP_FAIL;
+    tb.cmd_cb(&command, tb.cmd_ctx);
+    assert(s_power_limit_response_calls == 2);
+    assert(s_rpc_error_response_calls == 2);
+    assert(s_last_rpc_request_id == 43);
+
+    command.request_id = 44;
+    s_safety_get_thresholds_ret = ESP_FAIL;
+    s_rpc_error_response_ret = ESP_FAIL;
+    tb.cmd_cb(&command, tb.cmd_ctx);
+    assert(s_power_limit_response_calls == 2);
+    assert(s_rpc_error_response_calls == 3);
+    assert(s_last_rpc_request_id == 44);
+
+    assert(app_controller_stop(controller) == ESP_OK);
+    assert(app_controller_destroy(controller) == ESP_OK);
+}
+
 static void test_start_discards_startup_window_energy_delta_token(void)
 {
     relay_t relay = {0};
@@ -1300,6 +1357,7 @@ int main(void)
     test_metering_handler_runs_after_safety_handler();
     test_metering_handler_applies_safety_action_without_safety_event();
     test_metering_register_failure_rolls_back_handlers();
+    test_get_power_limit_rpc_sends_success_or_error_response();
     test_start_discards_startup_window_energy_delta_token();
     test_start_handoff_race_discards_metering_snapshot_token();
     test_stop_times_out_while_start_remains_in_progress();

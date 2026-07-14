@@ -16,10 +16,8 @@ extern "C" {
  *********************/
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
-#include "esp_err.h"
 #include "network_types.h"
 #include "safety_guard.h"
 
@@ -95,13 +93,6 @@ bool app_controller_internal_has_energy_delta_token(bool metering_valid,
 void app_controller_internal_build_telemetry(
     const app_controller_telemetry_source_t *source,
     app_controller_telemetry_output_t *out);
-
-/**
- * @brief 格式化功率限制响应
- * @details Format power limit response
- */
-esp_err_t app_controller_internal_format_power_limit_response(
-    char *buf, size_t buf_size, float power_limit_w, size_t *out_len);
 
 /**********************
  *      MACROS

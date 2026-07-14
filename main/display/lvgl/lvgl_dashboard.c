@@ -31,6 +31,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "lvgl_dashboard_timer_barrier.h"
 
 /*********************
  *      DEFINES
@@ -106,6 +107,7 @@ struct lvgl_dashboard {
     SemaphoreHandle_t lvgl_task_done_sema;
     portMUX_TYPE flush_lock;
     esp_timer_handle_t tick_timer;
+    lvgl_dashboard_timer_barrier_t tick_barrier;
     lvgl_dashboard_tick_ctx_t *tick_ctx;
     void *draw_buf_1;
     void *draw_buf_2;
@@ -136,6 +138,7 @@ struct lvgl_dashboard {
     bool lvgl_initialized_by_me;
     bool flush_cb_registered;
     bool tick_timer_started;
+    bool tick_drain_pending;
 };
 
 /**********************
@@ -503,6 +506,7 @@ lvgl_dashboard_t *lvgl_dashboard_create(const lvgl_dashboard_config_t *config)
 
     tick_timer_args.callback = lvgl_dashboard_tick_timer_cb;
     tick_timer_args.arg = me->tick_ctx;
+    tick_timer_args.dispatch_method = ESP_TIMER_TASK;
     tick_timer_args.name = "lvgl_tick";
     ESP_GOTO_ON_ERROR(esp_timer_create(&tick_timer_args, &me->tick_timer), err,
                       TAG, "create lvgl tick timer failed");
@@ -575,11 +579,15 @@ esp_err_t lvgl_dashboard_start(lvgl_dashboard_t *me)
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
+    if (me->destroying || (me->started && !me->tick_timer_started)) {
+        (void)xSemaphoreGive(me->mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (me->started) {
         (void)xSemaphoreGive(me->mutex);
         return ESP_OK;
     }
-    if (me->destroying || me->metering_handler != NULL ||
+    if (me->tick_drain_pending || me->metering_handler != NULL ||
         me->relay_handler != NULL || me->safety_handler != NULL ||
         me->tick_timer_started || me->lvgl_task != NULL) {
         (void)xSemaphoreGive(me->mutex);
@@ -629,6 +637,7 @@ esp_err_t lvgl_dashboard_start(lvgl_dashboard_t *me)
         ESP_LOGE(TAG, "start tick timer failed: %s", esp_err_to_name(ret));
         goto err;
     }
+    me->tick_drain_pending = true;
     timer_started = true;
 
     ESP_GOTO_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
@@ -685,7 +694,8 @@ esp_err_t lvgl_dashboard_stop(lvgl_dashboard_t *me)
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
     if (!me->started && !me->lvgl_task_running && me->lvgl_task == NULL &&
-        !me->tick_timer_started && me->metering_handler == NULL &&
+        !me->tick_timer_started && !me->tick_drain_pending &&
+        me->metering_handler == NULL &&
         me->relay_handler == NULL && me->safety_handler == NULL) {
         (void)xSemaphoreGive(me->mutex);
         return ESP_OK;
@@ -829,10 +839,7 @@ static esp_err_t lvgl_dashboard_release_resources(lvgl_dashboard_t *me)
     }
     if (me->tick_ctx != NULL) {
         lvgl_dashboard_tick_ctx_set_accepting(me->tick_ctx, false);
-        /* Do not free: esp_timer may already have copied the callback arg
-         * before stop/delete, and active-callback draining cannot see callbacks
-         * that have not entered yet. Keep this tombstone to avoid callback UAF.
-         */
+        free(me->tick_ctx);
         me->tick_ctx = NULL;
     }
 
@@ -1278,6 +1285,7 @@ static esp_err_t lvgl_dashboard_wait_for_tick_callbacks(
 static esp_err_t lvgl_dashboard_stop_tick_timer(lvgl_dashboard_t *me)
 {
     esp_err_t ret = ESP_OK;
+    bool timer_active = false;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "dashboard is null");
@@ -1286,11 +1294,25 @@ static esp_err_t lvgl_dashboard_stop_tick_timer(lvgl_dashboard_t *me)
 
     lvgl_dashboard_tick_ctx_set_accepting(me->tick_ctx, false);
 
-    if (me->tick_timer != NULL && me->tick_timer_started) {
+    if (me->tick_timer != NULL) {
+        timer_active = esp_timer_is_active(me->tick_timer);
+    }
+    if (timer_active) {
+        me->tick_drain_pending = true;
         ret = esp_timer_stop(me->tick_timer);
         if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
             return ret;
         }
+    }
+    me->tick_timer_started = false;
+
+    if (me->tick_drain_pending) {
+        ret = lvgl_dashboard_timer_barrier_wait(
+            &me->tick_barrier, LVGL_DASHBOARD_TICK_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        me->tick_drain_pending = false;
     }
 
     ret = lvgl_dashboard_wait_for_tick_callbacks(me->tick_ctx);

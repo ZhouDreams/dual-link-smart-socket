@@ -175,7 +175,12 @@ static void test_formatting(void)
     assert(tb_internal_format_power_limit_attribute(buf, sizeof(buf), NAN,
                                                    &out_len) == ESP_ERR_INVALID_ARG);
     assert(tb_internal_format_power_limit_attribute(buf, sizeof(buf), INFINITY,
-                                                   &out_len) == ESP_ERR_INVALID_ARG);
+                                                    &out_len) == ESP_ERR_INVALID_ARG);
+
+    assert(tb_internal_format_rpc_error_response(buf, sizeof(buf),
+                                                 &out_len) == ESP_OK);
+    assert(strcmp(buf, "{\"error\":\"internal_error\"}") == 0);
+    assert(out_len == strlen(buf));
 
     assert(tb_internal_format_rpc_response_topic(buf, sizeof(buf), 22,
                                                  &out_len) == ESP_OK);
