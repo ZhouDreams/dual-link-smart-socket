@@ -163,6 +163,8 @@ esp_err_t bl0942_read(bl0942_t *me, bl0942_measurement_t *out);
 /**
  * @brief 获取最近一次测量
  * @details Get latest measurement
+ * @note 仅读取缓存，不等待 UART 访问或硬复位完成。
+ *       Reads only the cache and does not wait for UART access or hard reset completion.
  * @param[in] me BL0942 句柄； BL0942 handle
  * @param[out] out 测量结果输出； Measurement output
  * @return

@@ -621,15 +621,21 @@ typedef enum {
 ```c
 struct bl0942 {
     bl0942_config_t config;
-    SemaphoreHandle_t mutex;             // 保护 latest 和硬件访问
+    SemaphoreHandle_t mutex;             // 短状态锁，仅保护 latest/has_latest
+    SemaphoreHandle_t io_mutex;          // 串行化 UART 访问、上下电和硬复位
+    SemaphoreHandle_t lifecycle_mutex;   // 保护生命周期和 active_ops
     bl0942_measurement_t latest;         // 最近一次成功的测量缓存
     bool has_latest;
     TaskHandle_t sample_task;            // 内部采样任务句柄
     SemaphoreHandle_t sample_task_done_sema;
-    bool sample_task_running;
+    int active_ops;
+    SemaphoreHandle_t active_ops_done_sema;
+    volatile bool sample_task_running;
+    bool stop_in_progress;
     uint32_t fault_cycles;               // 累计 FAULT 次数
     int consecutive_failures;            // 当前连续失败计数
     int hard_reset_count;                // 当前连续硬复位次数
+    bool destroying;
     bool initialized;
 };
 ```
@@ -693,8 +699,10 @@ esp_event_handler_register(BL0942_EVENT_BASE, BL0942_EVENT_MEASUREMENT,
 ### 5.7 关键设计决策
 
 - `bl0942_start()` 启动内部采样任务，周期由 `sample_period_ms` 配置（默认 100ms = 10Hz）
-- `bl0942_read()` 是同步阻塞接口，与内部采样任务通过 mutex 串行化，供启动前芯片验证或临时单次读取
-- `bl0942_get_latest()` 在 mutex 保护下返回缓存的最新测量值拷贝
+- `bl0942_read()` 是同步阻塞接口，与内部采样任务通过 `io_mutex` 串行化 UART 访问，供启动前芯片验证或临时单次读取
+- `bl0942_get_latest()` 只在短状态锁 `mutex` 保护下返回缓存拷贝，不等待 EN 上下电或 UART 重建
+- 硬复位全程持有 `io_mutex`，防止 UART 访问进入掉电/重建窗口；不得在约 2 秒上下电等待期间持有 `mutex`
+- 锁顺序固定为 `io_mutex -> mutex`；`lifecycle_mutex` 不与二者嵌套持有
 - 内部故障检测：连续失败达 `fault_threshold` → 发布 `BL0942_EVENT_FAULT` → 自动 EN-pin 硬复位 → 硬复位超 `hard_reset_max_attempts` 则停止采样任务
 - UART 配置只用单一波特率（`baud_rate`），不做启动波特率→运行波特率切换
 - 原始寄存器值不在此层转换工程量，换算逻辑属于 `metering_service`
@@ -1333,11 +1341,12 @@ struct network_manager {
     network_manager_sub_entry_t *sub_table;
     int sub_table_size;
     // 线程安全
-    SemaphoreHandle_t mutex;
+    SemaphoreHandle_t mutex;              // 短状态锁，不在持有期间调用链路 API
+    SemaphoreHandle_t control_mutex;      // 串行化 start/stop/switch 和订阅变更
     // 下行回调
     network_rx_cb_t rx_cb;
     void *rx_ctx;
-    int active_rx_callbacks;
+    atomic_int active_rx_callbacks;       // 回调退出无需重新获取状态锁
     // 内部状态
     uint64_t failback_since_us;
     TaskHandle_t monitor_task;
@@ -1376,6 +1385,9 @@ struct network_manager {
 - `start()` 启动规范化后的首选主链路，`active` 指向它；若启动失败则尝试 backup
 - 订阅意图表：`subscribe`/`unsubscribe` 写入表 → 立即委托给当前 `active` 链路；活动链路切换后遍历表在新链路上全部重放
 - `rx_cb` 统一接收当前活动链路的下行消息，透传给 `thingsboard_client`
+- `mutex` 只保护短状态快照和提交；`network_link_start/stop/get_status/set_active/subscribe/unsubscribe` 均在其外调用
+- `control_mutex` 串行化控制面操作和订阅表访问，可跨链路调用持有，但 RX 桥接不获取该锁，因此慢链路操作不会阻塞链路事件任务读取 manager 状态
+- 链路 RX 事件任务只有限等待 `mutex`；超时丢弃本条下行消息。回调计数使用原子增减，用户回调返回后不需要再次等待 manager mutex
 - 回切延迟防止 Wi-Fi 抖动导致频繁来回切换
 - `backup` 可以为 NULL（单链路模式），此时不启用故障切换
 - `destroy()` 采用非消费式失败语义：仅返回 `ESP_OK` 时释放句柄；monitor task、链路 stop 或 RX callback 清理失败时保持 `destroying=true`，其中链路 stop 失败还会保留 `stop_pending`；manager 及借用链路供后续 destroy 重试

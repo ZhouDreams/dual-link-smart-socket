@@ -21,6 +21,8 @@
 | TFT #1：MADCTL 初始化丢失 BGR 位 | 已修复 | 使用 `madctl_val` + `test_tft_panel_st7789t_init` |
 | architecture 中不存在的 display_service | 已修复 | 显示流改为 lvgl_dashboard 直接订阅业务事件 |
 | MS-02 / app M2：stop 收尾 mutex 中断后遗留 `stopping` | 已修复 | 重试取得收尾锁、恢复一致状态后返回超时 + app/metering lifecycle tests |
+| network_manager C-1/C-2：持状态锁调用链路 API、RX 事件任务无限等待 | 已修复 | 独立 control mutex + 链路调用移出短状态锁 + RX 有限等待和原子 callback drain tests |
+| BL0942-MUTEX-DELAY：hard reset 持缓存锁约 2 秒 | 已修复 | 拆分 cache/io mutex，复位仅独占 UART I/O；reset locking test 验证缓存读取不受阻塞 |
 
 ## 生命周期台账核对
 
@@ -35,9 +37,6 @@
 
 | 优先级 | 问题 | 当前判断 |
 |--------|------|----------|
-| P2 | network_manager C-1：持锁调用链路 set_active / subscribe | 当前链路 API 为快速异步提交；扩展同步链路前应解耦 |
-| P2 | network_manager C-2：链路事件任务无限等待 manager mutex | 当前临界区短，但会放大未来阻塞 |
-| P2 | BL0942-MUTEX-DELAY：hard reset 持锁约 2 秒 | 当前无外部并发读取调用方，公共 API 风险仍存在 |
 | P3 | app_controller M6：引用 thingsboard_client 内部头 | 应把响应格式化提升为公共 API 或由 ThingsBoard 层封装 |
 | P3 | app_controller M5：GET_POWER_LIMIT 失败不返回 RPC 错误 | 需先定义 ThingsBoard 错误响应格式 |
 | P4 | app_controller M4：1 Hz 成功遥测使用 ESP_LOGI | 应降为 debug 或抽样日志 |

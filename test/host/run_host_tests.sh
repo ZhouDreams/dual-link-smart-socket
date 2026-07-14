@@ -67,6 +67,14 @@ mkdir -p "${BUILD_DIR}"
 
 "${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
     -I"${ROOT_DIR}/test/support" \
+    -I"${ROOT_DIR}/main/bl0942" \
+    "${ROOT_DIR}/test/host/test_bl0942_reset_locking.c" \
+    -o "${BUILD_DIR}/test_bl0942_reset_locking"
+
+"${BUILD_DIR}/test_bl0942_reset_locking"
+
+"${CC_BIN}" -std=c11 -Wall -Wextra -Werror \
+    -I"${ROOT_DIR}/test/support" \
     -I"${ROOT_DIR}/main/display/tft" \
     "${ROOT_DIR}/main/display/tft/tft_panel_st7789t.c" \
     "${ROOT_DIR}/test/host/test_tft_panel_st7789t_init.c" \

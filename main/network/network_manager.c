@@ -12,6 +12,7 @@
 
 #include "network_manager.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +40,7 @@
 #define NETWORK_MANAGER_STOP_POLL_MS              (100U)
 #define NETWORK_MANAGER_RX_CB_POLL_MS             (10U)
 #define NETWORK_MANAGER_RX_CB_TIMEOUT_MS          (5000U)
+#define NETWORK_MANAGER_RX_MUTEX_TIMEOUT_MS       (10U)
 
 /**********************
  *      TYPEDEFS
@@ -76,9 +78,10 @@ struct network_manager {
     network_manager_sub_entry_t *sub_table;
     int sub_table_size;
     SemaphoreHandle_t mutex;
+    SemaphoreHandle_t control_mutex;
     network_rx_cb_t rx_cb;
     void *rx_ctx;
-    int active_rx_callbacks;
+    atomic_int active_rx_callbacks;
     uint64_t failback_since_us;
     TaskHandle_t monitor_task;
     SemaphoreHandle_t monitor_task_done_sema;
@@ -193,13 +196,15 @@ static esp_err_t network_manager_remove_subscription_locked(
     network_manager_t *me, const char *topic);
 
 /**
- * @brief 重放订阅意图
- * @details Replay subscription intents
+ * @brief 在控制锁保护下重放订阅意图
+ * @details Replay subscription intents while the control lock is held
+ * @note 调用方必须持有 control_mutex，且不得持有 mutex； The caller must hold
+ *       control_mutex and must not hold mutex
  * @param[in,out] me 管理器对象； Manager object
  * @param[in] link 目标链路； Target link
  * @return ESP-IDF 错误码； ESP-IDF error code
  */
-static esp_err_t network_manager_replay_subscriptions_locked(
+static esp_err_t network_manager_replay_subscriptions_controlled(
     network_manager_t *me, network_link_t *link);
 
 /**
@@ -259,13 +264,15 @@ static network_link_status_t network_manager_get_status_or_error(
     network_link_t *link);
 
 /**
- * @brief 切换活动链路并重放订阅
- * @details Switch active link and replay subscriptions
+ * @brief 在控制锁保护下切换活动链路并重放订阅
+ * @details Switch active link and replay subscriptions while the control lock is held
+ * @note 调用方必须持有 control_mutex，且不得持有 mutex； The caller must hold
+ *       control_mutex and must not hold mutex
  * @param[in,out] me 管理器对象； Manager object
  * @param[in] link 新活动链路； New active link
  */
-static void network_manager_switch_active_locked(network_manager_t *me,
-                                                 network_link_t *link);
+static void network_manager_switch_active_controlled(network_manager_t *me,
+                                                      network_link_t *link);
 
 /**
  * @brief 链路接收桥接回调
@@ -305,10 +312,18 @@ network_manager_t *network_manager_create(
     }
 
     network_manager_apply_config(config, me);
+    atomic_init(&me->active_rx_callbacks, 0);
 
     me->mutex = xSemaphoreCreateMutex();
     if (me->mutex == NULL) {
         ESP_LOGE(TAG, "create mutex failed");
+        network_manager_cleanup_create_failure(me, false, false);
+        return NULL;
+    }
+
+    me->control_mutex = xSemaphoreCreateMutex();
+    if (me->control_mutex == NULL) {
+        ESP_LOGE(TAG, "create control mutex failed");
         network_manager_cleanup_create_failure(me, false, false);
         return NULL;
     }
@@ -401,26 +416,38 @@ esp_err_t network_manager_start(network_manager_t *me)
     esp_err_t ret = ESP_OK;
     esp_err_t primary_ret = ESP_OK;
     network_link_t *selected = NULL;
+    network_link_t *other = NULL;
+    bool active_committed = false;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "manager is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_FALSE(me->control_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "control mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->control_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take control mutex failed");
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto out_control;
+    }
 
     if (me->started) {
         (void)xSemaphoreGive(me->mutex);
-        return ESP_OK;
+        goto out_control;
     }
     if (me->stop_pending) {
         (void)xSemaphoreGive(me->mutex);
-        return ESP_ERR_INVALID_STATE;
+        ret = ESP_ERR_INVALID_STATE;
+        goto out_control;
     }
     if (me->destroying) {
         (void)xSemaphoreGive(me->mutex);
-        return ESP_ERR_INVALID_STATE;
+        ret = ESP_ERR_INVALID_STATE;
+        goto out_control;
     }
+    (void)xSemaphoreGive(me->mutex);
 
     primary_ret = network_link_start(me->primary);
     if (primary_ret == ESP_OK) {
@@ -433,12 +460,24 @@ esp_err_t network_manager_start(network_manager_t *me)
     }
 
     if (selected == NULL) {
-        (void)xSemaphoreGive(me->mutex);
-        return primary_ret;
+        ret = primary_ret;
+        goto out_control;
     }
 
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto rollback_links;
+    }
+    if (me->destroying) {
+        (void)xSemaphoreGive(me->mutex);
+        ret = ESP_ERR_INVALID_STATE;
+        goto rollback_links;
+    }
     me->active = selected;
     me->failback_since_us = 0ULL;
+    active_committed = true;
+    (void)xSemaphoreGive(me->mutex);
+
     {
         esp_err_t engage_ret = network_link_set_active(selected, true);
         if (engage_ret != ESP_OK) {
@@ -449,8 +488,8 @@ esp_err_t network_manager_start(network_manager_t *me)
 
     /* Hot-standby: bring the non-selected link up too (best-effort). For LTE
      * this reaches the network-only DEGRADED standby state; MQTT is engaged
-     * only when it becomes active via switch_active_locked. */
-    network_link_t *other = (selected == me->primary) ? me->backup : me->primary;
+     * only when it becomes active via switch_active_controlled. */
+    other = (selected == me->primary) ? me->backup : me->primary;
     if (other != NULL) {
         esp_err_t other_ret = network_link_start(other);
         if (other_ret != ESP_OK) {
@@ -459,25 +498,56 @@ esp_err_t network_manager_start(network_manager_t *me)
         }
     }
 
-    ret = network_manager_replay_subscriptions_locked(me, selected);
+    ret = network_manager_replay_subscriptions_controlled(me, selected);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "replay subscriptions after start failed: %s",
                  esp_err_to_name(ret));
+        ret = ESP_OK;
+    }
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto rollback_links;
+    }
+    if (me->destroying) {
+        me->active = NULL;
+        me->failback_since_us = 0ULL;
+        active_committed = false;
+        (void)xSemaphoreGive(me->mutex);
+        ret = ESP_ERR_INVALID_STATE;
+        goto rollback_links;
     }
     ret = network_manager_start_monitor_locked(me);
     if (ret != ESP_OK) {
         me->active = NULL;
+        me->failback_since_us = 0ULL;
+        active_committed = false;
         (void)xSemaphoreGive(me->mutex);
-        if (other != NULL) {
-            (void)network_link_stop(other);
-        }
-        (void)network_link_stop(selected);
-        return ret;
+        goto rollback_links;
     }
 
     me->started = true;
     (void)xSemaphoreGive(me->mutex);
-    return ESP_OK;
+    goto out_control;
+
+rollback_links:
+    if (active_committed) {
+        while (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+            ESP_LOGW(TAG, "start rollback mutex wait interrupted; retrying");
+        }
+        if (me->active == selected) {
+            me->active = NULL;
+        }
+        me->started = false;
+        me->failback_since_us = 0ULL;
+        (void)xSemaphoreGive(me->mutex);
+    }
+    if (other != NULL) {
+        (void)network_link_stop(other);
+    }
+    (void)network_link_stop(selected);
+out_control:
+    (void)xSemaphoreGive(me->control_mutex);
+    return ret;
 }
 
 esp_err_t network_manager_stop(network_manager_t *me)
@@ -489,26 +559,34 @@ esp_err_t network_manager_stop(network_manager_t *me)
                         "manager is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
+    ESP_RETURN_ON_FALSE(me->control_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "control mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->control_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take control mutex failed");
 
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
+        first_error = ESP_ERR_TIMEOUT;
+        goto out_control;
     }
     if (!me->started && !me->monitor_task_running && me->monitor_task == NULL &&
         !me->stop_pending) {
         me->active = NULL;
         me->failback_since_us = 0ULL;
         (void)xSemaphoreGive(me->mutex);
-        return ESP_OK;
+        goto out_control;
     }
     (void)xSemaphoreGive(me->mutex);
 
     ret = network_manager_stop_monitor(me);
     if (ret != ESP_OK) {
-        return ret;
+        first_error = ret;
+        goto out_control;
     }
 
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
+        first_error = ESP_ERR_TIMEOUT;
+        goto out_control;
     }
     me->active = NULL;
     me->started = false;
@@ -536,7 +614,10 @@ esp_err_t network_manager_stop(network_manager_t *me)
     }
 
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return (first_error != ESP_OK) ? first_error : ESP_ERR_TIMEOUT;
+        if (first_error == ESP_OK) {
+            first_error = ESP_ERR_TIMEOUT;
+        }
+        goto out_control;
     }
     me->active = NULL;
     me->started = false;
@@ -544,6 +625,8 @@ esp_err_t network_manager_stop(network_manager_t *me)
     me->stop_pending = (first_error != ESP_OK);
     (void)xSemaphoreGive(me->mutex);
 
+out_control:
+    (void)xSemaphoreGive(me->control_mutex);
     return first_error;
 }
 
@@ -555,7 +638,10 @@ esp_err_t network_manager_get_status(network_manager_t *me,
     network_link_status_t primary_status = NETWORK_LINK_STATUS_ERROR;
     network_link_status_t backup_status = NETWORK_LINK_STATUS_IDLE;
     network_link_status_t active_status = NETWORK_LINK_STATUS_IDLE;
+    network_link_t *primary = NULL;
+    network_link_t *backup = NULL;
     network_link_t *active = NULL;
+    bool started = false;
 
     ESP_RETURN_ON_FALSE(me != NULL && out != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "invalid argument");
@@ -564,15 +650,20 @@ esp_err_t network_manager_get_status(network_manager_t *me,
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
+    primary = me->primary;
+    backup = me->backup;
     active = me->active;
-    ret = network_link_get_status(me->primary, &primary_status);
+    started = me->started;
+    (void)xSemaphoreGive(me->mutex);
+
+    ret = network_link_get_status(primary, &primary_status);
     if (ret != ESP_OK) {
         first_error = ret;
         primary_status = NETWORK_LINK_STATUS_ERROR;
     }
 
-    if (me->backup != NULL) {
-        ret = network_link_get_status(me->backup, &backup_status);
+    if (backup != NULL) {
+        ret = network_link_get_status(backup, &backup_status);
         if (ret != ESP_OK) {
             if (first_error == ESP_OK) {
                 first_error = ret;
@@ -581,19 +672,18 @@ esp_err_t network_manager_get_status(network_manager_t *me,
         }
     }
 
-    if (active == me->primary) {
+    if (active == primary) {
         active_status = primary_status;
-    } else if (active == me->backup) {
+    } else if (active == backup) {
         active_status = backup_status;
     }
 
     out->active_link = (active != NULL) ? network_link_get_type(active) :
                        NETWORK_LINK_TYPE_NONE;
-    out->ready = (active_status == NETWORK_LINK_STATUS_READY);
+    out->ready = started && active_status == NETWORK_LINK_STATUS_READY;
     out->primary_status = primary_status;
     out->backup_status = backup_status;
 
-    (void)xSemaphoreGive(me->mutex);
     return first_error;
 }
 
@@ -619,6 +709,7 @@ esp_err_t network_manager_publish(network_manager_t *me,
     network_link_t *active = NULL;
     network_link_status_t status = NETWORK_LINK_STATUS_IDLE;
     esp_err_t ret = ESP_OK;
+    bool started = false;
 
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "manager is null");
@@ -636,9 +727,10 @@ esp_err_t network_manager_publish(network_manager_t *me,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
     active = me->active;
+    started = me->started;
     (void)xSemaphoreGive(me->mutex);
 
-    if (active == NULL) {
+    if (!started || active == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -664,8 +756,15 @@ esp_err_t network_manager_subscribe(network_manager_t *me,
                         "manager is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_FALSE(me->control_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "control mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->control_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take control mutex failed");
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        (void)xSemaphoreGive(me->control_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
 
     ret = network_manager_store_subscription_locked(me, topic, qos);
     if (ret == ESP_OK) {
@@ -674,10 +773,13 @@ esp_err_t network_manager_subscribe(network_manager_t *me,
     (void)xSemaphoreGive(me->mutex);
 
     if (ret != ESP_OK || active == NULL) {
+        (void)xSemaphoreGive(me->control_mutex);
         return ret;
     }
 
-    return network_link_subscribe(active, topic, qos);
+    ret = network_link_subscribe(active, topic, qos);
+    (void)xSemaphoreGive(me->control_mutex);
+    return ret;
 }
 
 esp_err_t network_manager_unsubscribe(network_manager_t *me,
@@ -692,8 +794,15 @@ esp_err_t network_manager_unsubscribe(network_manager_t *me,
                         "manager is null");
     ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
                         "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_FALSE(me->control_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "control mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->control_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take control mutex failed");
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        (void)xSemaphoreGive(me->control_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
 
     ret = network_manager_remove_subscription_locked(me, topic);
     if (ret == ESP_OK) {
@@ -703,6 +812,7 @@ esp_err_t network_manager_unsubscribe(network_manager_t *me,
     (void)xSemaphoreGive(me->mutex);
 
     if (ret != ESP_OK) {
+        (void)xSemaphoreGive(me->control_mutex);
         return ret;
     }
 
@@ -719,6 +829,7 @@ esp_err_t network_manager_unsubscribe(network_manager_t *me,
         }
     }
 
+    (void)xSemaphoreGive(me->control_mutex);
     return first_error;
 }
 
@@ -734,28 +845,27 @@ esp_err_t network_manager_register_rx_cb(network_manager_t *me,
     ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "take mutex failed");
 
-    if (cb == NULL) {
-        me->rx_cb = NULL;
-        me->rx_ctx = NULL;
-        while (me->active_rx_callbacks > 0) {
-            if (waited_ms >= NETWORK_MANAGER_RX_CB_TIMEOUT_MS) {
-                (void)xSemaphoreGive(me->mutex);
-                ESP_LOGE(TAG, "wait for RX callbacks timed out");
-                return ESP_ERR_TIMEOUT;
-            }
-            (void)xSemaphoreGive(me->mutex);
-            vTaskDelay(pdMS_TO_TICKS(NETWORK_MANAGER_RX_CB_POLL_MS));
-            waited_ms += NETWORK_MANAGER_RX_CB_POLL_MS;
-            ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                                ESP_ERR_TIMEOUT, TAG,
-                                "take mutex failed");
-        }
-    } else {
+    if (cb != NULL) {
         me->rx_cb = cb;
         me->rx_ctx = ctx;
+        (void)xSemaphoreGive(me->mutex);
+        return ESP_OK;
     }
 
+    me->rx_cb = NULL;
+    me->rx_ctx = NULL;
     (void)xSemaphoreGive(me->mutex);
+
+    while (atomic_load_explicit(&me->active_rx_callbacks,
+                                memory_order_acquire) > 0) {
+        if (waited_ms >= NETWORK_MANAGER_RX_CB_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "wait for RX callbacks timed out");
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(NETWORK_MANAGER_RX_CB_POLL_MS));
+        waited_ms += NETWORK_MANAGER_RX_CB_POLL_MS;
+    }
+
     return ESP_OK;
 }
 
@@ -905,6 +1015,10 @@ static void network_manager_free_resources(network_manager_t *me)
         vSemaphoreDelete(me->monitor_task_done_sema);
         me->monitor_task_done_sema = NULL;
     }
+    if (me->control_mutex != NULL) {
+        vSemaphoreDelete(me->control_mutex);
+        me->control_mutex = NULL;
+    }
     if (me->mutex != NULL) {
         vSemaphoreDelete(me->mutex);
         me->mutex = NULL;
@@ -1008,7 +1122,7 @@ static esp_err_t network_manager_remove_subscription_locked(
     return ESP_OK;
 }
 
-static esp_err_t network_manager_replay_subscriptions_locked(
+static esp_err_t network_manager_replay_subscriptions_controlled(
     network_manager_t *me, network_link_t *link)
 {
     ESP_RETURN_ON_FALSE(me != NULL && link != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -1118,17 +1232,25 @@ static void network_manager_monitor_once(network_manager_t *me)
     network_link_t *primary = NULL;
     network_link_t *backup = NULL;
     network_link_t *active = NULL;
+    network_link_t *switch_target = NULL;
     network_link_status_t primary_status = NETWORK_LINK_STATUS_ERROR;
     network_link_status_t backup_status = NETWORK_LINK_STATUS_IDLE;
     bool should_start_backup = false;
     bool should_start_primary = false;
     const uint64_t now_us = (uint64_t)esp_timer_get_time();
 
-    if (me == NULL || me->mutex == NULL) {
+    if (me == NULL || me->mutex == NULL || me->control_mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(me->control_mutex, 0) != pdTRUE) {
         return;
     }
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return;
+        goto out_control;
+    }
+    if (!me->monitor_task_running) {
+        (void)xSemaphoreGive(me->mutex);
+        goto out_control;
     }
     primary = me->primary;
     backup = me->backup;
@@ -1163,11 +1285,11 @@ static void network_manager_monitor_once(network_manager_t *me)
     }
 
     if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
-        return;
+        goto out_control;
     }
     if (!me->monitor_task_running) {
         (void)xSemaphoreGive(me->mutex);
-        return;
+        goto out_control;
     }
 
     active = me->active;
@@ -1175,12 +1297,12 @@ static void network_manager_monitor_once(network_manager_t *me)
         if (!network_manager_status_is_usable(primary_status) &&
             backup != NULL &&
             network_manager_status_is_usable(backup_status)) {
-            network_manager_switch_active_locked(me, backup);
+            switch_target = backup;
         } else if (primary_status == NETWORK_LINK_STATUS_READY) {
             me->failback_since_us = 0ULL;
         }
         (void)xSemaphoreGive(me->mutex);
-        return;
+        goto switch_link;
     }
 
     if (active == backup) {
@@ -1189,7 +1311,7 @@ static void network_manager_monitor_once(network_manager_t *me)
                 me->failback_since_us = now_us;
             } else if ((now_us - me->failback_since_us) >=
                        ((uint64_t)me->failback_delay_ms * 1000ULL)) {
-                network_manager_switch_active_locked(me, primary);
+                switch_target = primary;
             }
         } else {
             me->failback_since_us = 0ULL;
@@ -1197,6 +1319,13 @@ static void network_manager_monitor_once(network_manager_t *me)
     }
 
     (void)xSemaphoreGive(me->mutex);
+
+switch_link:
+    if (switch_target != NULL) {
+        network_manager_switch_active_controlled(me, switch_target);
+    }
+out_control:
+    (void)xSemaphoreGive(me->control_mutex);
 }
 
 static void network_manager_monitor_delay(network_manager_t *me,
@@ -1243,19 +1372,27 @@ static network_link_status_t network_manager_get_status_or_error(
     return status;
 }
 
-static void network_manager_switch_active_locked(network_manager_t *me,
-                                                 network_link_t *link)
+static void network_manager_switch_active_controlled(network_manager_t *me,
+                                                      network_link_t *link)
 {
     esp_err_t ret = ESP_OK;
     network_link_t *old = NULL;
 
-    if (me == NULL || link == NULL || me->active == link) {
+    if (me == NULL || link == NULL || me->mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (me->active == link) {
+        (void)xSemaphoreGive(me->mutex);
         return;
     }
 
     old = me->active;
     me->active = link;
     me->failback_since_us = 0ULL;
+    (void)xSemaphoreGive(me->mutex);
 
     /* Engage the new active link (LTE: brings up MQTT -> aims for READY) and
      * disengage the old (LTE: stops MQTT, keeps network -> DEGRADED standby).
@@ -1277,7 +1414,7 @@ static void network_manager_switch_active_locked(network_manager_t *me,
         }
     }
 
-    ret = network_manager_replay_subscriptions_locked(me, link);
+    ret = network_manager_replay_subscriptions_controlled(me, link);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "replay subscriptions after switch failed: %s",
                  esp_err_to_name(ret));
@@ -1294,6 +1431,7 @@ static void network_manager_on_link_rx(const network_rx_data_t *rx_data,
     network_link_t *active = NULL;
     network_rx_cb_t rx_cb = NULL;
     void *rx_ctx = NULL;
+    bool deliver = false;
 
     if (bridge_ctx == NULL || bridge_ctx->manager == NULL) {
         return;
@@ -1301,7 +1439,10 @@ static void network_manager_on_link_rx(const network_rx_data_t *rx_data,
 
     me = bridge_ctx->manager;
     source_link = bridge_ctx->link;
-    if (me->mutex == NULL || xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+    if (me->mutex == NULL ||
+        xSemaphoreTake(me->mutex,
+                       pdMS_TO_TICKS(NETWORK_MANAGER_RX_MUTEX_TIMEOUT_MS)) !=
+            pdTRUE) {
         return;
     }
     active = me->active;
@@ -1310,16 +1451,16 @@ static void network_manager_on_link_rx(const network_rx_data_t *rx_data,
     if (me->destroying) {
         rx_cb = NULL;
     }
-    if (source_link == active && rx_cb != NULL) {
-        me->active_rx_callbacks++;
+    deliver = source_link == active && rx_cb != NULL;
+    if (deliver) {
+        (void)atomic_fetch_add_explicit(&me->active_rx_callbacks, 1,
+                                        memory_order_acq_rel);
     }
     (void)xSemaphoreGive(me->mutex);
 
-    if (source_link == active && rx_cb != NULL) {
+    if (deliver) {
         rx_cb(rx_data, rx_ctx);
-        if (xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE) {
-            me->active_rx_callbacks--;
-            (void)xSemaphoreGive(me->mutex);
-        }
+        (void)atomic_fetch_sub_explicit(&me->active_rx_callbacks, 1,
+                                        memory_order_release);
     }
 }

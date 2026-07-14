@@ -59,6 +59,7 @@
 struct bl0942 {
     bl0942_config_t config;
     SemaphoreHandle_t mutex;
+    SemaphoreHandle_t io_mutex;
     SemaphoreHandle_t lifecycle_mutex;
     bl0942_measurement_t latest;
     bool has_latest;
@@ -320,6 +321,12 @@ bl0942_t *bl0942_create(const bl0942_config_t *config)
         goto err;
     }
 
+    me->io_mutex = xSemaphoreCreateMutex();
+    if (me->io_mutex == NULL) {
+        ESP_LOGE(TAG, "create io mutex failed");
+        goto err;
+    }
+
     me->lifecycle_mutex = xSemaphoreCreateMutex();
     if (me->lifecycle_mutex == NULL) {
         ESP_LOGE(TAG, "create lifecycle mutex failed");
@@ -403,6 +410,9 @@ err:
     if (me->lifecycle_mutex != NULL) {
         vSemaphoreDelete(me->lifecycle_mutex);
     }
+    if (me->io_mutex != NULL) {
+        vSemaphoreDelete(me->io_mutex);
+    }
     if (me->mutex != NULL) {
         vSemaphoreDelete(me->mutex);
     }
@@ -435,18 +445,23 @@ esp_err_t bl0942_destroy(bl0942_t *me)
         return ret;
     }
 
-    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_FALSE(me->io_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "io mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->io_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take io mutex failed");
 
     ret = bl0942_uart_delete(me->config.uart_num);
+    (void)xSemaphoreGive(me->io_mutex);
     if (ret != ESP_OK) {
-        (void)xSemaphoreGive(me->mutex);
         ESP_LOGW(TAG, "delete uart driver failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
+    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
     me->initialized = false;
     (void)xSemaphoreGive(me->mutex);
 
@@ -458,6 +473,9 @@ esp_err_t bl0942_destroy(bl0942_t *me)
     }
     if (me->lifecycle_mutex != NULL) {
         vSemaphoreDelete(me->lifecycle_mutex);
+    }
+    if (me->io_mutex != NULL) {
+        vSemaphoreDelete(me->io_mutex);
     }
     if (me->mutex != NULL) {
         vSemaphoreDelete(me->mutex);
@@ -562,11 +580,11 @@ esp_err_t bl0942_read(bl0942_t *me, bl0942_measurement_t *out)
         ret = ESP_ERR_INVALID_ARG;
         goto leave;
     }
-    if (!me->initialized || me->mutex == NULL) {
+    if (!me->initialized || me->mutex == NULL || me->io_mutex == NULL) {
         ret = ESP_ERR_INVALID_STATE;
         goto leave;
     }
-    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(me->io_mutex, portMAX_DELAY) != pdTRUE) {
         ret = ESP_ERR_TIMEOUT;
         goto leave;
     }
@@ -578,33 +596,28 @@ esp_err_t bl0942_read(bl0942_t *me, bl0942_measurement_t *out)
 
     bl0942_build_packet_read_cmd(me->config.device_address, cmd);
 
-    if (me->destroying) {
-        ret = ESP_ERR_INVALID_STATE;
-        goto out;
-    }
-
     if (!uart_is_driver_installed(me->config.uart_num)) {
         ret = ESP_ERR_INVALID_STATE;
-        goto out;
+        goto out_io;
     }
 
     ret = uart_flush_input(me->config.uart_num);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "flush uart input failed: %s", esp_err_to_name(ret));
-        goto out;
+        goto out_io;
     }
 
     const int written = uart_write_bytes(me->config.uart_num, cmd, sizeof(cmd));
     if (written != (int)sizeof(cmd)) {
         ESP_LOGW(TAG, "write read command failed, written=%d", written);
         ret = ESP_FAIL;
-        goto out;
+        goto out_io;
     }
 
     ret = uart_wait_tx_done(me->config.uart_num, timeout_ticks);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "uart tx wait failed: %s", esp_err_to_name(ret));
-        goto out;
+        goto out_io;
     }
 
     const int read_len = uart_read_bytes(me->config.uart_num, frame,
@@ -613,13 +626,13 @@ esp_err_t bl0942_read(bl0942_t *me, bl0942_measurement_t *out)
         ESP_LOGW(TAG, "expected %d bytes, received %d", (int)sizeof(frame),
                  read_len);
         ret = ESP_ERR_TIMEOUT;
-        goto out;
+        goto out_io;
     }
 
     if (frame[0] != BL0942_FRAME_HEADER) {
         ESP_LOGW(TAG, "invalid frame header: 0x%02X", frame[0]);
         ret = ESP_ERR_INVALID_RESPONSE;
-        goto out;
+        goto out_io;
     }
 
     const uint8_t expected_checksum =
@@ -628,16 +641,21 @@ esp_err_t bl0942_read(bl0942_t *me, bl0942_measurement_t *out)
         ESP_LOGW(TAG, "checksum mismatch, expected=0x%02X actual=0x%02X",
                  expected_checksum, frame[BL0942_FRAME_SIZE - 1]);
         ret = ESP_ERR_INVALID_RESPONSE;
-        goto out;
+        goto out_io;
     }
 
     bl0942_parse_packet(frame, &measurement);
+    if (xSemaphoreTake(me->mutex, portMAX_DELAY) != pdTRUE) {
+        ret = ESP_ERR_TIMEOUT;
+        goto out_io;
+    }
     me->latest = measurement;
     me->has_latest = true;
     *out = measurement;
-
-out:
     (void)xSemaphoreGive(me->mutex);
+
+out_io:
+    (void)xSemaphoreGive(me->io_mutex);
 leave:
     bl0942_leave_op(me);
     return ret;
@@ -1066,10 +1084,11 @@ static esp_err_t bl0942_hard_reset(bl0942_t *me)
 {
     ESP_RETURN_ON_FALSE(me != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "bl0942 is null");
-    ESP_RETURN_ON_FALSE(me->mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "mutex is null");
-    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->mutex, portMAX_DELAY) == pdTRUE,
-                        ESP_ERR_TIMEOUT, TAG, "take mutex failed");
+    ESP_RETURN_ON_FALSE(me->io_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "io mutex is null");
+    ESP_RETURN_ON_FALSE(xSemaphoreTake(me->io_mutex,
+                                       portMAX_DELAY) == pdTRUE,
+                        ESP_ERR_TIMEOUT, TAG, "take io mutex failed");
 
     esp_err_t ret = bl0942_power_cycle(me->config.en_gpio);
     if (ret != ESP_OK) {
@@ -1104,7 +1123,7 @@ static esp_err_t bl0942_hard_reset(bl0942_t *me)
              me->config.baud_rate);
 
 out:
-    (void)xSemaphoreGive(me->mutex);
+    (void)xSemaphoreGive(me->io_mutex);
     return ret;
 }
 
